@@ -38,8 +38,9 @@ What **does not work** yet:
 * **Spawn data from the server.** The 10.x World keeps no `npc_spawns*.json` / `doodad_spawns*.json`;
   the bots need them to find NPCs and doodads, so they are built from the client's level data (see
   below). Spawners that only an event activates are listed like any other.
-* Each race starts in its own zone; a bot is logged out again when the zone host of its start zone is
-  not running. Restrict `[bots] races` to the zones your server runs.
+* **One zone host per zone.** The 10.x server runs a zone host per zone, and a bot that walks into
+  a zone without one is logged out again. `[bots] zones` keeps the everyday goals (quest, grind,
+  wander, explore) inside the zones you list, and `[bots] races` decides the start zones.
 
 ## What changed against the 1.2 version
 

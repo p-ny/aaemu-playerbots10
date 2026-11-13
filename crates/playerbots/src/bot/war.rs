@@ -35,11 +35,19 @@ pub fn avoiding(cfg: &EventsCfg) -> bool {
     cfg.enabled && cfg.avoid_war_zones
 }
 
+/// Whether (x, y) lies outside the zones of `[bots] zones` (never when the list is empty; a
+/// position outside the baked zone grid counts as outside a non-empty list).
+pub fn outside_zones(world: &World, zones: &[u32], x: f32, y: f32) -> bool {
+    !zones.is_empty() && !world.zone_key_at(x, y).is_some_and(|k| zones.contains(&u32::from(k)))
+}
+
 impl Ctx<'_> {
     /// Whether the everyday goals must not choose (x, y) as a destination: the bot avoids war
-    /// zones and (x, y) lies in a zone group at war.
+    /// zones and (x, y) lies in a zone group at war, or (x, y) is outside the zones of
+    /// `[bots] zones`.
     pub fn in_war_zone(&self, x: f32, y: f32) -> bool {
-        avoiding(&self.cfg.events) && at_war(self.world, self.state, x, y)
+        (avoiding(&self.cfg.events) && at_war(self.world, self.state, x, y))
+            || outside_zones(self.world, &self.cfg.bots.zones, x, y)
     }
 }
 

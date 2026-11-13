@@ -167,6 +167,10 @@ pub struct BotsCfg {
     /// With `gm_bootstrap`, trips longer than this many metres use `/move` instead of walking;
     /// 0 never teleports.
     pub long_travel_teleport_m: f32,
+    /// Zone keys the everyday goals (quest, grind, wander, explore, the director's plans) may
+    /// choose destinations in; empty = everywhere. On a server that runs one zone host per zone,
+    /// list the zones whose hosts run.
+    pub zones: Vec<u32>,
     /// First wait after a failed connection.
     pub reconnect_min_secs: u64,
     /// Longest wait between two connection attempts (the wait doubles up to this).
@@ -190,6 +194,7 @@ impl Default for BotsCfg {
             move_speed: 5.4,
             walk_speed: 1.8,
             long_travel_teleport_m: 0.0,
+            zones: Vec::new(),
             reconnect_min_secs: 5,
             reconnect_max_secs: 120,
         }
