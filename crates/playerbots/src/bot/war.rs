@@ -38,7 +38,10 @@ pub fn avoiding(cfg: &EventsCfg) -> bool {
 /// Whether (x, y) lies outside the zones of `[bots] zones` (never when the list is empty; a
 /// position outside the baked zone grid counts as outside a non-empty list).
 pub fn outside_zones(world: &World, zones: &[u32], x: f32, y: f32) -> bool {
-    !zones.is_empty() && !world.zone_key_at(x, y).is_some_and(|k| zones.contains(&u32::from(k)))
+    !zones.is_empty()
+        && !world
+            .zone_key_at(x, y)
+            .is_some_and(|k| zones.contains(&u32::from(k)))
 }
 
 impl Ctx<'_> {

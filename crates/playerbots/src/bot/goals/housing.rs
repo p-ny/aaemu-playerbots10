@@ -410,9 +410,9 @@ impl Housing {
             .housing_areas
             .iter()
             .filter(|p| {
-                p.points.first().is_some_and(|q| {
-                    !crate::bot::war::outside_zones(ctx.world, zones, q[0], q[1])
-                })
+                p.points
+                    .first()
+                    .is_some_and(|q| !crate::bot::war::outside_zones(ctx.world, zones, q[0], q[1]))
             })
             .map(|p| p.id)
             .collect();
