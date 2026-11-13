@@ -302,8 +302,9 @@ fn request(
     npc2: u32,
     fill: impl FnOnce(&mut PacketStream),
 ) -> crate::cs::Out {
+    // 10.x auction requests carry no auctioneer objects (the server checks the distance itself).
+    let _ = (npc, npc2);
     let mut s = PacketStream::new();
-    s.write_bc(npc).write_bc(npc2);
     fill(&mut s);
     crate::cs::Out {
         level: LEVEL_GAME,
@@ -326,11 +327,14 @@ pub fn post(
     buyout: i32,
     duration: u8,
 ) -> crate::cs::Out {
+    // 10.x: u64 item, i64 start, i64 buyout, u8 duration, i32 min stack, i32 max stack
     request(cs::CSAuctionPostPacket, npc, npc2, |s| {
         s.write_u64(item_id)
-            .write_i32(start)
-            .write_i32(buyout)
-            .write_u8(duration);
+            .write_i64(i64::from(start))
+            .write_i64(i64::from(buyout))
+            .write_u8(duration)
+            .write_i32(0)
+            .write_i32(0);
     })
 }
 
@@ -387,11 +391,14 @@ pub fn search(npc: u32, npc2: u32, q: &Search<'_>) -> crate::cs::Out {
             .write_u8(q.categories[1])
             .write_u8(q.categories[2])
             .write_i32(q.page)
-            .write_u32(q.client_id)
-            .write_i32(0)
-            .write_u8(0)
+            .write_u64(u64::from(q.client_id))
+            .write_i32(0) // filter
+            .write_i32(0) // item list count
+            .write_u8(0) // world
             .write_u8(q.levels[0])
             .write_u8(q.levels[1])
+            .write_i64(0) // min price
+            .write_i64(0) // max price
             .write_u8(q.sort[0])
             .write_u8(q.sort[1]);
     })
@@ -414,7 +421,7 @@ pub fn bid(
     my_name: &str,
     money: i32,
 ) -> crate::cs::Out {
-    request(cs::CSBidAuctionPacket, npc, npc2, |s| {
+    request(crate::game::UNKNOWN_OPCODE, npc, npc2, |s| {
         write_lot_header(s, lot);
         s.write_u64(lot.id)
             .write_u8(lot.world)
@@ -430,7 +437,7 @@ pub fn bid(
 ///
 /// Body: `bc npc, bc npc2`, then the lot as in [`bid`].
 pub fn cancel(npc: u32, npc2: u32, lot: &Lot) -> crate::cs::Out {
-    request(cs::CSCancelAuctionPacket, npc, npc2, |s| {
+    request(crate::game::UNKNOWN_OPCODE, npc, npc2, |s| {
         write_lot_header(s, lot);
     })
 }

@@ -1687,13 +1687,13 @@ mod tests {
         assert!((rig.motion.yaw() + std::f32::consts::FRAC_PI_2).abs() < 0.01);
         let first = &rig.out[0];
         assert_eq!(flags(first), 0x02);
-        // rotation z byte at offset 3 (bc) + 1 + 4 + 1 + 9 + 6 + 2
+        // rotation z byte at offset 3 (bc) + 1 + 4 + 1 + 11 + 6 + 2
         assert_eq!(
-            first.body[26] as i8,
+            first.body[28] as i8,
             cs::yaw_to_direction(-std::f32::consts::FRAC_PI_2)
         );
         // velocity x is the run speed in the client's units (32767 / 60 per m/s)
-        let vx = i16::from_le_bytes([first.body[18], first.body[19]]);
+        let vx = i16::from_le_bytes([first.body[20], first.body[21]]);
         assert_eq!(vx, (5.4f32 * 32767.0 / 60.0).round() as i16);
     }
 
@@ -1854,7 +1854,7 @@ mod tests {
         let pos = rig.motion.pos();
         assert!((pos[0] - 20.0).abs() < 0.05 && (pos[1] - 20.0).abs() < 0.05);
         // it went via (10, 20): the first moving packet heads +Y (yaw 0)
-        assert_eq!(rig.out[0].body[26] as i8, 0);
+        assert_eq!(rig.out[0].body[28] as i8, 0);
     }
 
     #[test]
@@ -1951,7 +1951,7 @@ mod tests {
             .face(rig.motion.pos()[0], rig.motion.pos()[1] + 5.0);
         rig.tick(&t, 250, 250);
         assert_eq!(rig.out.len(), 2);
-        assert_eq!(rig.out[1].body[26] as i8, 0);
+        assert_eq!(rig.out[1].body[28] as i8, 0);
         // facing the same way again sends nothing
         rig.motion
             .face(rig.motion.pos()[0], rig.motion.pos()[1] + 9.0);

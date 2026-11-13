@@ -146,8 +146,14 @@ impl Dungeons {
         let mut rules: Vec<(u32, Rules)> = Vec::new();
         each_row(
             conn,
-            "SELECT zone_group_id, level_min, level_max, max_players, pvp, item_id, party_only, \
-             client_driven, select_channel, name FROM indun_zones",
+            if crate::sql::has_column(conn, "indun_zones", "item_id") {
+                "SELECT zone_group_id, level_min, level_max, max_players, pvp, item_id, party_only, \
+             client_driven, select_channel, name FROM indun_zones"
+            } else {
+                "SELECT d.zone_group_id, d.level_min, d.level_max, d.max_players, d.pvp, NULL, d.party_only, \
+             d.client_driven, d.select_channel, COALESCE(z.name, '') FROM indun_zones d \
+             LEFT JOIN zone_groups z ON z.id = d.zone_group_id"
+            },
             |r| {
                 rules.push((
                     r.u32(0),

@@ -552,8 +552,9 @@ fn a_bot_now_and_then_greets_a_bot_standing_close_by() {
 
 fn decode_chat(out: &Out) -> (i16, String, String) {
     let b = &out.body;
-    let kind = i16::from_le_bytes([b[0], b[1]]);
-    let mut at = 8;
+    // 10.x: u8 locale, u64 chat (type in the low 16 bits), str target, u8 world, str text
+    let kind = i16::from_le_bytes([b[1], b[2]]);
+    let mut at = 9;
     let string = |at: &mut usize| {
         let n = u16::from_le_bytes([b[*at], b[*at + 1]]) as usize;
         let s = String::from_utf8(b[*at + 2..*at + 2 + n].to_vec()).unwrap();
@@ -561,6 +562,7 @@ fn decode_chat(out: &Out) -> (i16, String, String) {
         s
     };
     let target = string(&mut at);
+    at += 1; // target world
     let text = string(&mut at);
     (kind, target, text)
 }

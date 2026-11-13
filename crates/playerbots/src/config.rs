@@ -461,7 +461,7 @@ impl Default for MarketCfg {
     fn default() -> Self {
         Self {
             enabled: true,
-            auction: true,
+            auction: false, // the 10.x auction lot packets are not ported yet
             chat_ads: true,
             sell_to_players: false,
             meet_at: MeetAt::Auto,
@@ -1944,13 +1944,16 @@ sail = true
     #[test]
     fn the_market_keys_have_quiet_defaults() {
         let m = Config::default().market;
-        assert!(m.enabled && m.auction && m.chat_ads);
+        assert!(
+            m.enabled && !m.auction && m.chat_ads,
+            "the auction waits for the 10.x port"
+        );
         assert!(!m.sell_to_players, "selling to players is opt-in");
         assert_eq!(m.meet_at, MeetAt::Auto);
         assert_eq!((m.max_ads_per_hour, m.ad_interval_secs), (12, 900));
         // the example file documents every key with its default
         let ex = Config::parse(Config::example()).unwrap().market;
-        assert!(ex.enabled && ex.auction && ex.chat_ads && !ex.sell_to_players);
+        assert!(ex.enabled && !ex.auction && ex.chat_ads && !ex.sell_to_players);
         assert_eq!(ex.meet_at, MeetAt::Auto);
         assert_eq!((ex.max_ads_per_hour, ex.ad_interval_secs), (12, 900));
         let section = Config::example()
@@ -1970,7 +1973,7 @@ sail = true
             .expect("a [market] section");
         for key in [
             "enabled = true",
-            "auction = true",
+            "auction = false",
             "chat_ads = true",
             "sell_to_players = false",
             "meet_at = \"auto\"",

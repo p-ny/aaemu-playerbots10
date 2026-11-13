@@ -158,8 +158,14 @@ impl Economy {
         let mut bundle_prices: Vec<(u32, u32, u32)> = Vec::new();
         each_row(
             conn,
-            "SELECT b.item_id, b.specialty_bundle_id, b.profit, b.ratio, COALESCE(i.refund, 0) \
-             FROM specialty_bundle_items b LEFT JOIN items i ON i.id = b.item_id ORDER BY b.id",
+            if crate::sql::has_column(conn, "items", "refund") {
+                "SELECT b.item_id, b.specialty_bundle_id, b.profit, b.ratio, COALESCE(i.refund, 0) \
+             FROM specialty_bundle_items b LEFT JOIN items i ON i.id = b.item_id ORDER BY b.id"
+            } else {
+                "SELECT b.item_id, b.specialty_bundle_id, b.profit, b.ratio, \
+             COALESCE(gp.refund, 0) \
+             FROM specialty_bundle_items b LEFT JOIN (SELECT item_id, MIN(price) AS price, MIN(refund) AS refund FROM item_prices WHERE currency_id = 0 GROUP BY item_id) gp ON gp.item_id = b.item_id ORDER BY b.id"
+            },
             |r| bundle_prices.push((r.u32(0), r.u32(1), base_price(r.u32(2), r.u32(3), r.u32(4)))),
         )?;
         // the server keeps the last row of an (item, bundle) pair
@@ -169,7 +175,12 @@ impl Economy {
         let mut zone_pairs: Vec<(u32, u32, u32, u32)> = Vec::new();
         each_row(
             conn,
-            "SELECT row_zone_group_id, col_zone_group_id, ratio, profit FROM specialties",
+            // 10.x specialties carry no per-route ratio or profit: 100 % and no bonus
+            if crate::sql::has_column(conn, "specialties", "ratio") {
+                "SELECT row_zone_group_id, col_zone_group_id, ratio, profit FROM specialties"
+            } else {
+                "SELECT row_zone_group_id, col_zone_group_id, 100, 0 FROM specialties"
+            },
             |r| zone_pairs.push((r.u32(0), r.u32(1), r.u32(2), r.u32(3))),
         )?;
         zone_pairs.sort_by_key(|p| (p.0, p.1));

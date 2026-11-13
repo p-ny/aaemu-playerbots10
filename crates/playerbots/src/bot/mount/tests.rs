@@ -530,7 +530,7 @@ fn a_glide_descends_lands_and_continues_the_trip() {
         zs.push(m.pos()[2]);
         for p in &out {
             if p.opcode == aa_proto::opcodes::cs::CSMoveUnitPacket
-                && p.body.get(30) == Some(&cs::STANCE_GLIDE)
+                && p.body.get(32) == Some(&cs::STANCE_GLIDE)
             {
                 glide_packet = true;
             }

@@ -1,6 +1,6 @@
 [package]
 name = "aa-proto"
-description = "ArcheAge 1.2 (r208022) client-side wire protocol for AAEmu: framing, packet codec, login and game connections"
+description = "ArcheAge 10.0.2.13 client-side wire protocol for AAEmu: framing, encryption, packet codec, login and game connections"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,6 +20,9 @@ futures.workspace = true
 bytes.workspace = true
 miniz_oxide.workspace = true
 sha2.workspace = true
+aes.workspace = true
+rsa = "0.9"
+rand = "0.8"
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

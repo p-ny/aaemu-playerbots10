@@ -111,9 +111,15 @@ impl Skills {
         let mut rows = Vec::new();
         each_row(
             conn,
-            "SELECT id, name, ability_id, ability_level, cooldown_time, casting_time, mana_cost, \
+            if crate::sql::has_column(conn, "skills", "need_learn") {
+                "SELECT id, name, ability_id, ability_level, cooldown_time, casting_time, mana_cost, \
              min_range, max_range, target_type_id, target_relation_id, consume_lp, auto_learn, \
-             need_learn, mana_level_md FROM skills",
+             need_learn, mana_level_md FROM skills"
+            } else {
+                "SELECT id, name, ability_id, ability_level, cooldown_time, casting_time, mana_cost, \
+             min_range, max_range, target_type_id, target_relation_id, consume_lp, auto_learn, \
+             CASE WHEN skill_points > 0 THEN 't' ELSE 'f' END, mana_level_md FROM skills"
+            },
             |r| {
                 let id = r.u32(0);
                 rows.push((

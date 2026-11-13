@@ -6,12 +6,13 @@
 # Every key is optional; the values below are the defaults. Unknown keys are an error.
 
 [server]
-# Public login port of the AAEmu Rust server (the port the client connects to).
+# Public login port of the AAEmu login server (the port the client connects to).
 login = "127.0.0.1:1237"
 # Game server (world) id to enter. 0 = the first active world the login server lists.
 world_id = 0
 # Bot accounts are "<prefix><bot id>" (pb1, pb2, ...). The login server creates unknown
-# accounts on first login (AutoAccount = true in its Config.json).
+# accounts on first login (AutoAccount = true in its Config.json). Bots log in with the launcher
+# web auth (account + password) and answer the V2 challenge when the server asks for it.
 account_prefix = "pb"
 # Password of every bot account. Empty = the environment variable PLAYERBOTS_PASSWORD, and if
 # that is not set either, a random password generated on the first run and kept in
@@ -21,20 +22,24 @@ account_prefix = "pb"
 password = ""
 
 [data]
-# The server's compact.sqlite3 (opened read-only).
+# The 10.x compact.sqlite3 (opened read-only), e.g. the client's game/db/compact.sqlite3 decrypted,
+# or the one the zone hosts load.
 compact = "compact.sqlite3"
-# The server's app/Data directory (Worlds/<world>/*.json, CharTemplates.json).
+# A data directory with CharTemplates.json, Portal/ and Worlds/<world>/npc_spawns*.json and
+# doodad_spawns*.json. The 10.x World keeps no spawn json: build them from the client's level data
+# with tools/export_spawns.py and tools/export_doodads.py, and copy CharTemplates.json and Portal/
+# from the AAEmu World's Data directory.
 server_data = "Data"
-# Output directory of `playerbots bake` (terrain heights, world map, housing areas, quest spheres,
-# zones). Without it bots walk on flat terrain and the web map has no picture.
+# Output directory of `playerbots bake` (terrain heights, navmeshes, world map, housing areas,
+# quest spheres, zones). Without it bots walk straight lines on flat terrain.
 # baked = "baked"
 world = "main_world"
 
 # Typical paths with the AAEmu server checked out on the same machine (uncomment and adapt; forward
 # slashes work on Windows too):
-#   compact     = "<AAEmu>/rust/crates/aaemu-game/app/Data/compact.sqlite3"
-#   server_data = "<AAEmu>/rust/crates/aaemu-game/app/Data"
-#   baked       = "<data dir>"
+#   compact     = "<client>/game/db/compact.sqlite3"
+#   server_data = "<bot data dir>"
+#   baked       = "<bake output dir>"
 
 [bots]
 # Bots started at launch. More can be started and stopped from the web UI.
@@ -159,7 +164,8 @@ glide_descent = 3.0
 # from a vendor), never GM-made ones. false = no bot lists, advertises or sells anything.
 enabled = true
 # Bots list surplus goods at the auction house (goal "auction").
-auction = true
+# The 10.x auction lot packets are not ported yet: keep this off.
+auction = false
 # Bots advertise surplus goods in trade chat (goal "market").
 chat_ads = true
 # Bots sell advertised goods to real players in a trade. Off by default, and ignored while

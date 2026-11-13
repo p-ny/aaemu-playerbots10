@@ -24,6 +24,7 @@
 
 pub mod auction;
 pub mod codec;
+pub mod crypto;
 pub mod cs;
 pub mod game;
 pub mod guild;

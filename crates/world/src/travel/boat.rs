@@ -592,8 +592,15 @@ impl Boats {
         let mut items: Vec<(u32, u32, u32, u32)> = Vec::new(); // item, skill, price, slave
         each_row(
             conn,
-            "SELECT i.id, i.use_skill_id, i.price, m.slave_id FROM items i \
-             JOIN item_summon_slaves m ON m.item_id = i.id WHERE i.use_skill_id != 0 ORDER BY i.id",
+            if crate::sql::has_column(conn, "items", "price") {
+                "SELECT i.id, i.use_skill_id, i.price, m.slave_id FROM items i \
+             JOIN item_summon_slaves m ON m.item_id = i.id WHERE i.use_skill_id != 0 ORDER BY i.id"
+            } else {
+                "SELECT i.id, i.use_skill_id, \
+             COALESCE(gp.price, 0), m.slave_id FROM items i \
+             LEFT JOIN (SELECT item_id, MIN(price) AS price, MIN(refund) AS refund FROM item_prices WHERE currency_id = 0 GROUP BY item_id) gp ON gp.item_id = i.id \
+             JOIN item_summon_slaves m ON m.item_id = i.id WHERE i.use_skill_id != 0 ORDER BY i.id"
+            },
             |r| {
                 if summon_skills.contains(&r.u32(1)) {
                     items.push((r.u32(0), r.u32(1), r.u32(2), r.u32(3)));
@@ -851,9 +858,16 @@ fn ship_stats(
     let mut stats_of_ship: FxHashMap<u32, ShipStats> = FxHashMap::default();
     each_row(
         conn,
-        "SELECT id, velocity, turn_accel, accel, reverse_accel, reverse_velocity, \
+        // 10.x ship models have no linear/reverse acceleration columns: steer_vel stands in
+        if crate::sql::has_column(conn, "ship_models", "accel") {
+            "SELECT id, velocity, turn_accel, accel, reverse_accel, reverse_velocity, \
          mass_box_size_x, mass_box_size_y, mass_box_size_z, mass_center_y, mass_center_z, \
-         keel_height FROM ship_models",
+         keel_height FROM ship_models"
+        } else {
+            "SELECT id, velocity, turn_accel, steer_vel, steer_vel, reverse_velocity, \
+         mass_box_size_x, mass_box_size_y, mass_box_size_z, mass_center_y, mass_center_z, \
+         keel_height FROM ship_models"
+        },
         |r| {
             stats_of_ship.insert(
                 r.u32(0),

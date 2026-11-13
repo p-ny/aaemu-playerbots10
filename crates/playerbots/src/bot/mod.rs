@@ -728,6 +728,12 @@ impl Bot {
         if p.level == LEVEL_PROXY && p.opcode == pp::PongPacket {
             self.on_pong(p, now);
         }
+        if p.level == LEVEL_PROXY && p.opcode == pp::PingPacket {
+            if let Some(pong) = cs::pong_for(&p.body, self.state.now_ms as u32) {
+                self.out.push(pong);
+            }
+            return;
+        }
         let (mut ev, ship) = match session::decode_checked(p) {
             Decoded::Event(ev) => (ev, None),
             Decoded::Ship { moved, motion } => (moved, Some(motion)),

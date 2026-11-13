@@ -143,9 +143,15 @@ impl ItemTable {
         let mut rows: Vec<(u32, ItemFacts)> = Vec::with_capacity(22_000);
         each_row(
             conn,
-            "SELECT id, price, refund, bind_id, max_stack_size, sellable, level, fixed_grade, \
+            if crate::sql::has_column(conn, "items", "price") {
+                "SELECT id, price, refund, bind_id, max_stack_size, sellable, level, fixed_grade, \
              auction_a_category_id, auction_b_category_id, auction_c_category_id, \
-             category_id, loot_quest_id FROM items",
+             category_id, loot_quest_id FROM items"
+            } else {
+                "SELECT id, COALESCE(gp.price, 0), COALESCE(gp.refund, 0), bind_id, max_stack_size, sellable, level, fixed_grade, \
+             auction_a_category_id, auction_b_category_id, auction_c_category_id, \
+             category_id, loot_quest_id FROM items LEFT JOIN (SELECT item_id, MIN(price) AS price, MIN(refund) AS refund FROM item_prices WHERE currency_id = 0 GROUP BY item_id) gp ON gp.item_id = items.id"
+            },
             |r| {
                 rows.push((
                     r.u32(0),

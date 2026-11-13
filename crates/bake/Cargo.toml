@@ -1,6 +1,6 @@
 [package]
 name = "aa-bake"
-description = "Extract bot data (heights, world map, housing areas, quest spheres, zones) from the ArcheAge 1.2 game_pak"
+description = "Extract bot data (heights, world map, housing areas, quest spheres, zones) from the ArcheAge game_pak (1.2 and 10.0.2.13)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

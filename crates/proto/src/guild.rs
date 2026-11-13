@@ -324,16 +324,20 @@ const MIN_MEMBER_LEN: usize = 4 + 4 + 1 + 1 + 8 + 2 + 1 + 4 + 4 + 3 + 1 + 8 + 8 
 /// The smallest `write_system_faction`: empty strings.
 const MIN_FACTION_LEN: usize = 4 + 1 + 4 + 2 + 4 + 2 + 1 + 1 + 8 + 1 + 1;
 
+/// 10.x `ExpeditionMember.Write`: i32 guild, u64 character, in party, online, last leave time,
+/// name, level, heir level, u32 zone, i32 faction, three abilities, role, fx64 x, fx64 y, f32 z,
+/// memo, transfer time, contribution, weekly contribution, gear score.
 fn read_member(s: &mut PacketStream) -> Result<MemberBrief, MarshalError> {
     let guild = s.read_u32()?;
-    let char_id = s.read_u32()?;
+    let char_id = s.read_u64()? as u32;
     s.read_bool()?; // in party
     let online = s.read_bool()?;
     s.read_i64()?; // last time in the world
     let name = s.read_string()?.into_boxed_str();
     let level = s.read_u8()?;
+    s.read_u8()?; // heir level
     s.read_u32()?; // zone
-    s.read_u32()?; // id3
+    s.read_u32()?; // faction
     s.read_bytes(3)?; // abilities
     let role = s.read_u8()?;
     s.read_i64()?; // x
@@ -341,6 +345,7 @@ fn read_member(s: &mut PacketStream) -> Result<MemberBrief, MarshalError> {
     s.read_f32()?; // z
     s.read_string()?; // memo
     s.read_i64()?; // transfer requested
+    s.read_bytes(4 + 4 + 4)?; // contribution, weekly contribution, gear score
     Ok(MemberBrief {
         guild,
         char_id,
@@ -435,7 +440,7 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<GuildEvent>, 
         },
         sc::SCExpeditionInvitationPacket => |s| {
             Ok(GuildEvent::Invitation {
-                inviter: s.read_u32()?,
+                inviter: s.read_u64()? as u32,
                 inviter_name: s.read_string()?.into_boxed_str(),
                 guild: s.read_u32()?,
                 guild_name: s.read_string()?.into_boxed_str(),
@@ -453,16 +458,20 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<GuildEvent>, 
             })
         },
         sc::SCExpeditionRoleChangedPacket => |s| {
+            // 10.x: u64 character, str name, u32 role
+            let char_id = s.read_u64()? as u32;
+            let name = s.read_string()?.into_boxed_str();
+            let role = s.read_u32()? as u8;
             Ok(GuildEvent::RoleChanged {
-                char_id: s.read_u32()?,
-                role: s.read_u8()?,
-                name: s.read_string()?.into_boxed_str(),
+                char_id,
+                role,
+                name,
             })
         },
         sc::SCExpeditionOwnerChangedPacket => |s| {
             Ok(GuildEvent::OwnerChanged {
-                from: s.read_u32()?,
-                to: s.read_u32()?,
+                from: s.read_u64()? as u32,
+                to: s.read_u64()? as u32,
                 name: s.read_string()?.into_boxed_str(),
             })
         },

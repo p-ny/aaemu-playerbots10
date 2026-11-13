@@ -1,40 +1,24 @@
-//! Game server connection for the 1.2 protocol.
+//! Game server connection for the 10.0.2.13 protocol (AAEmu 10.x World).
 //!
-//! Ported from the AAEmu-1.2-Rust test client (`aaemu-testclient/src/game.rs`, GPL-3.0-or-later)
-//! and reshaped for hundreds of bots in one process: the connection is a plain struct owned by
-//! one task, there is no reader task and no channel, and a received packet costs no copy.
+//! Derived from the 1.2 connection of this crate and reshaped for hundreds of bots in one process:
+//! the connection is a plain struct owned by one task, there is no reader task and no channel.
 //!
-//! # Wire format (`aaemu-game/src/net/packet.rs`)
+//! # Wire format
 //!
 //! Every frame is `[u16 len][payload]` ([`crate::codec::FrameCodec`]) and every payload starts
-//! `0xDD [level]`. There is no encryption and no checksum.
+//! `0xDD [level]`.
 //!
 //! | dir | level | payload |
 //! | --- | --- | --- |
-//! | C→S | 1 game | `DD 01 00 <count> <u16 opcode> <body>`; `count` is a wrapping per-connection counter the server never verifies |
-//! | C→S | 2 proxy | `DD 02 <u16 opcode> <body>` |
-//! | S→C | 1 game | `DD 01 <hash> <count> <u16 opcode> <body>` (the server writes 0, 0) |
+//! | C→S | 1 game | `DD 01 00 00 <u16 opcode> <body>`, only before the key exchange |
+//! | C→S | 5 game | `DD 05 <ctos cipher of [crc8][count][u16 opcode][body]>`, after `CSAesXorKey` |
+//! | C→S | 2 proxy | `DD 02 <u16 opcode> <body>` (never encrypted) |
+//! | S→C | 1 game | `DD 01 <crc> <count> <u16 opcode> <body>` |
+//! | S→C | 5 game | `DD 05 <stoc cipher of [crc8][count][u16 opcode][body]>` |
 //! | S→C | 2 proxy | `DD 02 <u16 opcode> <body>` |
-//! | S→C | 4 batch | `DD 04 <u16 count> <raw deflate>` |
+//! | S→C | 4 batch | `DD 04 <u16 count> <raw deflate>`; the 10.x World never sends it, kept for safety |
 //!
-//! # Level 4 batches (`CompressedGamePackets`)
-//!
-//! The inflated payload is `count` entries of `[u16 0][u16 opcode][body]`. **Entries carry no
-//! length**, so [`GameConn::recv`] must know how long each body is. This server batches exactly
-//! four packet types (`aaemu-game/src/systems/skills/packets.rs` `CompressedGamePackets::add`
-//! callers: `effects/combat.rs` damage and heal, `plots.rs` `flush_execution_queue`,
-//! `instances/instant_game.rs` `reset_all_skill_cooldowns`):
-//!
-//! `SCUnitDamagedPacket`, `SCUnitHealedPacket`, `SCPlotEventPacket`,
-//! `SCSkillCooldownResetPacket`.
-//!
-//! All four can be split, plus a few more the native format uses (see [`batch_entry_len`]). An
-//! entry with an opcode the splitter cannot size ends the batch: the entries before it are
-//! delivered, the rest are counted in [`ConnStats::batch_entries_dropped`]. Level-1 `SCUnitDeath`
-//! and buff packets other than the above are never batched by this server.
-//!
-//! Inflated batches are capped at [`MAX_BATCH_BYTES`] and [`MAX_BATCH_ENTRIES`]; a batch over
-//! either limit is dropped whole.
+//! Level-5 packets are delivered as level [`LEVEL_GAME`], so callers see one game level.
 
 use std::collections::VecDeque;
 use std::fmt::Display;
@@ -49,6 +33,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::codec::{FrameCodec, Parts};
+use crate::crypto::{self, ctos::CsCipher};
 use crate::cs::Out;
 use crate::opcodes::{pp, sc};
 
@@ -60,6 +45,10 @@ pub const LEVEL_GAME: u8 = 1;
 pub const LEVEL_PROXY: u8 = 2;
 /// Level 4: `CompressedGamePackets`, a raw-deflate batch of level-1 packets.
 pub const LEVEL_COMPRESSED: u8 = 4;
+/// Level 5: an encrypted game packet (both directions after the key exchange).
+pub const LEVEL_ENCRYPTED: u8 = 5;
+/// The opcode of a packet that has no 10.x opcode ([`crate::opcodes`] marks those `0xfff`).
+pub const UNKNOWN_OPCODE: u16 = 0xfff;
 /// Largest frame payload the transport can carry (`u16` length).
 pub const MAX_FRAME: usize = u16::MAX as usize;
 /// Hard cap on an inflated batch.
@@ -217,6 +206,10 @@ pub struct GameConn<R = OwnedReadHalf, W = OwnedWriteHalf> {
     pending: VecDeque<Packet>,
     count: u8,
     stats: ConnStats,
+    /// The C→S cipher, once `CSAesXorKey` is sent.
+    cipher: Option<CsCipher>,
+    /// Fake servers in tests: decrypts the client's level-5 packets.
+    server_decipher: Option<crate::crypto::ctos::CsDecipher>,
 }
 
 impl GameConn {
@@ -252,7 +245,26 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> GameConn<R, W> {
             pending: VecDeque::new(),
             count: 0,
             stats: ConnStats::default(),
+            cipher: None,
+            server_decipher: None,
         }
+    }
+
+    /// Fake servers in tests: from now on level-5 frames are the client's, decrypted with `d`.
+    pub fn accept_client_cipher(&mut self, d: crate::crypto::ctos::CsDecipher) {
+        self.server_decipher = Some(d);
+    }
+
+    /// From now on level-1 packets are sent encrypted (level 5). Call right after sending
+    /// `CSAesXorKey` with the keys it carried.
+    pub fn enable_encryption(&mut self, cipher: CsCipher) {
+        self.cipher = Some(cipher);
+        self.count = 0;
+    }
+
+    /// Whether game packets are sent encrypted.
+    pub fn encrypted(&self) -> bool {
+        self.cipher.is_some()
     }
 
     /// The connection's counters.
@@ -262,29 +274,51 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> GameConn<R, W> {
 
     /// Queues one packet and flushes it.
     ///
-    /// Level 1 is sent as `DD 01 00 <count> <op> <body>` with a wrapping count byte, any other
-    /// level (2 = proxy) as `DD <level> <op> <body>`. Cancelling the future after the frame is
-    /// queued is harmless: the frame is flushed by the next `send`/[`GameConn::flush`].
+    /// Level 1 is sent encrypted as level 5 once [`GameConn::enable_encryption`] was called, as
+    /// plain `DD 01 00 00 <op> <body>` before; any other level (2 = proxy) as
+    /// `DD <level> <op> <body>`. Cancelling the future after the frame is queued is harmless: the
+    /// frame is flushed by the next `send`/[`GameConn::flush`].
     pub async fn send(&mut self, out: &Out) -> Result<()> {
+        if out.level == LEVEL_GAME && out.opcode == UNKNOWN_OPCODE {
+            // A packet the 10.x client does not have: never put it on the wire.
+            tracing::debug!(packet = out.name(), "not sent: no 10.x opcode");
+            return Ok(());
+        }
         let [op_lo, op_hi] = out.opcode.to_le_bytes();
-        let (head, head_len) = if out.level == LEVEL_GAME {
-            ([FRAME_MAGIC, LEVEL_GAME, 0, self.count, op_lo, op_hi], 6)
-        } else {
-            ([FRAME_MAGIC, out.level, op_lo, op_hi, 0, 0], 4)
+        let frame: Vec<u8> = match (&mut self.cipher, out.level) {
+            (Some(cipher), LEVEL_GAME) => {
+                let mut plain = Vec::with_capacity(4 + out.body.len());
+                plain.push(0);
+                plain.push(self.count);
+                plain.extend_from_slice(&[op_lo, op_hi]);
+                plain.extend_from_slice(&out.body);
+                plain[0] = crypto::crc8(&plain[1..]);
+                self.count = self.count.wrapping_add(1);
+                let mut f = vec![FRAME_MAGIC, LEVEL_ENCRYPTED];
+                f.extend(cipher.encrypt(&plain));
+                f
+            }
+            (None, LEVEL_GAME) => {
+                let mut f = vec![FRAME_MAGIC, LEVEL_GAME, 0, 0, op_lo, op_hi];
+                f.extend_from_slice(&out.body);
+                f
+            }
+            (_, level) => {
+                let mut f = vec![FRAME_MAGIC, level, op_lo, op_hi];
+                f.extend_from_slice(&out.body);
+                f
+            }
         };
-        let len = head_len + out.body.len();
+        let len = frame.len();
         if len > MAX_FRAME {
             return Err(GameError::TooLarge { len });
         }
         self.wr
             .feed(Parts {
-                head: &head[..head_len],
-                body: &out.body,
+                head: &frame,
+                body: &[],
             })
             .await?;
-        if out.level == LEVEL_GAME {
-            self.count = self.count.wrapping_add(1);
-        }
         self.stats.packets_out += 1;
         self.stats.bytes_out += len as u64 + 2;
         self.flush().await
@@ -341,6 +375,29 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> GameConn<R, W> {
                     level: LEVEL_GAME,
                     opcode: u16::from_le_bytes([frame[4], frame[5]]),
                     body: frame.slice(6..),
+                });
+            }
+            LEVEL_ENCRYPTED => {
+                let mut data = match &mut self.server_decipher {
+                    Some(d) => d.decrypt(&frame),
+                    None => {
+                        let mut data = frame[2..].to_vec();
+                        crypto::stoc::apply(&mut data);
+                        data
+                    }
+                };
+                if data.len() < 4 {
+                    return Err(GameError::BadFrame("short level-5 frame"));
+                }
+                if data[0] != crypto::crc8(&data[1..]) {
+                    return Err(GameError::BadFrame("level-5 checksum mismatch"));
+                }
+                let opcode = u16::from_le_bytes([data[2], data[3]]);
+                let body = Bytes::from(data).slice(4..);
+                self.pending.push_back(Packet {
+                    level: LEVEL_GAME,
+                    opcode,
+                    body,
                 });
             }
             LEVEL_PROXY => self.pending.push_back(Packet {
@@ -681,6 +738,7 @@ mod tests {
 
     /// The `Marshal` output of the server's packets, rebuilt by hand, must be sized exactly.
     #[test]
+    #[ignore = "1.2 DD04 batch layout; the 10.x World never sends DD04"]
     fn sizes_the_batched_server_packets() {
         // SCUnitDamagedPacket: cast action Skill, caster Unit, ids, pisc x2, tail.
         let mut s = PacketStream::new();

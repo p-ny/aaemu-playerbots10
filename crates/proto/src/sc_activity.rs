@@ -49,6 +49,10 @@ pub mod quest_status {
 }
 
 /// `det` values of [`ActivityEvent::DuelEnded`] (G/systems/social/duel.rs:54-60).
+/// The object id that stands for the receiving character in 10.x duel packets, which are sent to
+/// each side separately and name only the opponent.
+pub const SELF_OBJ: u32 = u32::MAX;
+
 pub mod duel_det {
     /// The receiver lost (not sent by the server today; it uses `WIN` with swapped ids).
     pub const LOSE: u8 = 0;
@@ -881,26 +885,30 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         },
         sc::SCQuestContextUpdatedPacket => |s| {
             let quest = Box::new(read_quest_row(s)?);
-            let component = s.read_u32()?;
-            let p = [s.read_i32()?, s.read_i32()?, s.read_i32()?, s.read_i32()?];
+            // 10.x: component and the four counters packed with five zeros
+            let v = s.read_pisc_w(10)?;
+            let component = v[0] as u32;
+            let p = [v[1] as i32, v[2] as i32, v[3] as i32, v[4] as i32];
             Ok(E::QuestUpdated {
                 quest,
                 component,
                 p,
             })
         },
+        // 10.x: i32 quest, i32 component (no completed-block mask)
         sc::SCQuestContextCompletedPacket => |s| {
             Ok(E::QuestCompleted {
                 quest_id: s.read_u32()?,
-                block_mask: s.read_u64()?,
+                block_mask: 0,
                 component: s.read_u32()?,
             })
         },
         sc::SCQuestContextResetPacket => |s| {
+            // 10.x: the quest id only
             Ok(E::QuestReset {
                 quest_id: s.read_u32()?,
-                block_mask: s.read_u64()?,
-                block_id: s.read_u32()?,
+                block_mask: 0,
+                block_id: 0,
             })
         },
         sc::SCQuestContextFailedPacket => |s| {
@@ -916,6 +924,9 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             let kind = if flags & 0x01 != 0 { s.read_u8()? } else { 0 };
             let message_id = if flags & 0x02 != 0 { s.read_u16()? } else { 0 };
             let value = if flags & 0x04 != 0 { s.read_u32()? } else { 0 };
+            if flags & 0x08 != 0 {
+                s.read_bool()?; // display message
+            }
             Ok(E::QuestUnitReqFailed {
                 quest_id,
                 unit_obj,
@@ -941,31 +952,65 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         },
         // duel
         sc::SCDuelChallengedPacket => |s| {
-            Ok(E::DuelChallenged {
-                challenger_char_id: s.read_u32()?,
-            })
+            let challenger_char_id = s.read_u64()? as u32;
+            s.read_u8()?; // duel type
+            Ok(E::DuelChallenged { challenger_char_id })
         },
         sc::SCDuelStartCountdownPacket => |_| Ok(E::DuelStartCountdown),
         sc::SCDuelStartedPacket => |s| {
+            // 10.x: bc opponent, u8 duel type (sent to each side)
+            let opponent = s.read_bc()?;
+            s.read_u8()?;
             Ok(E::DuelStarted {
-                challenger_obj: s.read_bc()?,
-                challenged_obj: s.read_bc()?,
+                challenger_obj: SELF_OBJ,
+                challenged_obj: opponent,
             })
         },
         sc::SCDuelEndedPacket => |s| {
+            // 10.x: bool is win, u8 det (0 draw, 1 decided, 2 cancel), u32 count of opponent
+            // objects, u32 count of opponent characters (u64)
+            let is_win = s.read_bool()?;
+            let det = match s.read_u8()? {
+                0 => duel_det::DRAW,
+                2 => duel_det::SURRENDER,
+                _ => duel_det::WIN,
+            };
+            let objs = s.read_u32()? as usize;
+            check_count(s, objs, 3)?;
+            let mut opponent_obj = 0;
+            for i in 0..objs {
+                let o = s.read_bc()?;
+                if i == 0 {
+                    opponent_obj = o;
+                }
+            }
+            let ids = s.read_u32()? as usize;
+            check_count(s, ids, 8)?;
+            let mut opponent_id = 0;
+            for i in 0..ids {
+                let id = s.read_u64()? as u32;
+                if i == 0 {
+                    opponent_id = id;
+                }
+            }
+            let (winner_obj, loser_obj, winner_id, loser_id) = if is_win {
+                (SELF_OBJ, opponent_obj, 0, opponent_id)
+            } else {
+                (opponent_obj, SELF_OBJ, opponent_id, 0)
+            };
             Ok(E::DuelEnded {
-                winner_id: s.read_u32()?,
-                loser_id: s.read_u32()?,
-                winner_obj: s.read_bc()?,
-                loser_obj: s.read_bc()?,
-                det: s.read_u8()?,
+                winner_id,
+                loser_id,
+                winner_obj,
+                loser_obj,
+                det,
             })
         },
         sc::SCDuelStatePacket => |s| {
-            Ok(E::DuelState {
-                obj: s.read_bc()?,
-                flag_obj: s.read_bc()?,
-            })
+            let (obj, flag_obj) = (s.read_bc()?, s.read_bc()?);
+            s.read_u8()?; // duel team
+            s.read_bool()?; // ejected
+            Ok(E::DuelState { obj, flag_obj })
         },
         // trade
         sc::SCCanStartTradePacket => |s| {
@@ -1015,19 +1060,18 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         },
         sc::SCTradeMoneyPutupPacket => |s| {
             Ok(E::TradeMoneyPutup {
-                amount: s.read_i32()?,
+                amount: clamp_i32(s.read_i64()?),
             })
         },
         sc::SCOtherTradeMoneyPutupPacket => |s| {
             Ok(E::OtherTradeMoneyPutup {
-                amount: s.read_i32()?,
+                amount: clamp_i32(s.read_i64()?),
             })
         },
         sc::SCTradeLockUpdatePacket => |s| {
-            Ok(E::TradeLockUpdate {
-                mine: s.read_bool()?,
-                other: s.read_bool()?,
-            })
+            let (mine, other) = (s.read_bool()?, s.read_bool()?);
+            s.read_bool()?; // my will
+            Ok(E::TradeLockUpdate { mine, other })
         },
         sc::SCTradeOkUpdatePacket => |s| {
             Ok(E::TradeOkUpdate {
@@ -1040,7 +1084,10 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             let action = s.read_u8()?;
             let tasks = s.read_u8()?;
             s.set_pos(start);
-            let items = crate::sc_world::read_item_task_info(s).unwrap_or_default();
+            let items = crate::sc_world::read_item_task_list(s).unwrap_or_default();
+            if s.remaining() >= 8 + 4 + 1 {
+                skip(s, 8 + 4 + 1)?; // type, lock slot key, query result
+            }
             Ok(E::TradeMade {
                 action,
                 tasks,
@@ -1049,11 +1096,17 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         },
         // team
         sc::SCAskToJoinTeamPacket => |s| {
+            // 10.x: i32 team, u64 inviter, str name, i8 team role (1 party), i64 log event
+            let team_id = s.read_u32()?;
+            let sender_char_id = s.read_u64()? as u32;
+            let name = read_str(s)?;
+            let is_party = s.read_u8()? == 1;
+            s.read_i64()?;
             Ok(E::AskToJoinTeam {
-                team_id: s.read_u32()?,
-                sender_char_id: s.read_u32()?,
-                name: read_str(s)?,
-                is_party: s.read_bool()?,
+                team_id,
+                sender_char_id,
+                name,
+                is_party,
             })
         },
         sc::SCJoinedTeamPacket => joined_team,
@@ -1067,7 +1120,7 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         sc::SCTeamMemberLeavedPacket => |s| {
             Ok(E::TeamMemberLeft {
                 team_id: s.read_u32()?,
-                char_id: s.read_u32()?,
+                char_id: s.read_u64()? as u32,
                 kicked: s.read_bool()?,
             })
         },
@@ -1092,28 +1145,28 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         sc::SCTeamOwnerChangedPacket => |s| {
             Ok(E::TeamOwnerChanged {
                 team_id: s.read_u32()?,
-                owner_id: s.read_u32()?,
+                owner_id: s.read_u64()? as u32,
             })
         },
         sc::SCTeamRemoteMembersExPacket => team_remote_members,
         sc::SCTeamMemberDisconnectedPacket => |s| {
             Ok(E::TeamMemberDisconnected {
                 team_id: s.read_u32()?,
-                char_id: s.read_u32()?,
+                char_id: s.read_u64()? as u32,
                 person: Box::new(read_team_person(s)?),
             })
         },
         sc::SCTeamMemberRoleChangedPacket => |s| {
             Ok(E::TeamMemberRoleChanged {
                 team_id: s.read_u32()?,
-                char_id: s.read_u32()?,
+                char_id: s.read_u64()? as u32,
                 role: s.read_u8()?,
             })
         },
         sc::SCRefreshTeamMemberPacket => |s| {
             Ok(E::TeamRefreshMember {
                 team_id: s.read_u32()?,
-                char_id: s.read_u32()?,
+                char_id: s.read_u64()? as u32,
                 obj_id: s.read_bc()?,
             })
         },
@@ -1122,7 +1175,7 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
                 team_id: s.read_u32()?,
                 method: s.read_u8()?,
                 min_grade: s.read_u8()?,
-                master: s.read_u32()?,
+                master: s.read_u64()? as u32,
                 roll_bop: s.read_bool()?,
                 flags: s.read_u8()?,
             })
@@ -1138,14 +1191,24 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         sc::SCMyHouseRemovedPacket => |s| Ok(E::MyHouseRemoved { tl: s.read_u16()? }),
         sc::SCHouseDemolishedPacket => |s| Ok(E::HouseDemolished { tl: s.read_u16()? }),
         sc::SCConstructHouseTaxPacket => |s| {
+            // 10.x: amounts are u64, then the weekly amount (u64) and the hostile tax rate (u32)
+            let design = s.read_u32()?;
+            let heavy_count = s.read_i32()?;
+            let normal_count = s.read_i32()?;
+            let heavy = s.read_bool()?;
+            let base = clamp_i32(s.read_u64()? as i64);
+            let deposit = clamp_i32(s.read_u64()? as i64);
+            let total = clamp_i32(s.read_u64()? as i64);
+            s.read_u64()?;
+            s.read_u32()?;
             Ok(E::ConstructHouseTax {
-                design: s.read_u32()?,
-                heavy_count: s.read_i32()?,
-                normal_count: s.read_i32()?,
-                heavy: s.read_bool()?,
-                base: s.read_i32()?,
-                deposit: s.read_i32()?,
-                total: s.read_i32()?,
+                design,
+                heavy_count,
+                normal_count,
+                heavy,
+                base,
+                deposit,
+                total,
             })
         },
         sc::SCHouseBuildProgressPacket => |s| {
@@ -1157,15 +1220,28 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             })
         },
         sc::SCHouseTaxInfoPacket => |s| {
+            // 10.x: u16 tl, u32 dominion rate, u32 hostile rate, u64 money, u64 money 2, i64 due,
+            // bool paid, i8 weeks without pay, u8 weeks prepaid, bool heavy, u8 tax type
+            let tl = s.read_u16()?;
+            let dominion_tax_rate = s.read_u32()? as i32;
+            s.read_u32()?;
+            let deposit = clamp_i32(s.read_u64()? as i64);
+            let total = clamp_i32(s.read_u64()? as i64);
+            let due = s.read_i64()?;
+            let already_paid = s.read_bool()?;
+            let weeks_without_pay = i32::from(s.read_u8()? as i8);
+            s.read_u8()?;
+            let heavy = s.read_bool()?;
+            s.read_u8()?;
             Ok(E::HouseTaxInfo {
-                tl: s.read_u16()?,
-                dominion_tax_rate: s.read_i32()?,
-                deposit: s.read_i32()?,
-                total: s.read_i32()?,
-                due: s.read_i64()?,
-                already_paid: s.read_bool()?,
-                weeks_without_pay: s.read_i32()?,
-                heavy: s.read_bool()?,
+                tl,
+                dominion_tax_rate,
+                deposit,
+                total,
+                due,
+                already_paid,
+                weeks_without_pay,
+                heavy,
             })
         },
         // mail
@@ -1176,10 +1252,13 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         },
         sc::SCGotMailPacket => mail_received,
         sc::SCMailListPacket => mail_list,
+        // 10.x: u8 list kind, unread counts
         sc::SCMailListEndPacket => |s| {
+            s.read_u8()?;
+            let unread = read_unread(s)?;
             Ok(E::MailListEnd {
-                total_headers: s.read_i32()?,
-                total_bodies: s.read_i32()?,
+                total_headers: unread[1],
+                total_bodies: 0,
             })
         },
         sc::SCMailBodyPacket => |s| {
@@ -1187,12 +1266,18 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
                 is_prepare: s.read_bool()?,
                 is_sent: s.read_bool()?,
                 body: Box::new(read_mail_body(s)?),
-                open_date_modified: s.read_bool()?,
+                open_date_modified: {
+                    s.read_u64()?; // extra
+                    s.read_bool()?
+                },
                 unread: read_unread(s)?,
             })
         },
+        // 10.x: bool group sending, header, unread counts, ten slot pairs
         sc::SCMailSentPacket => |s| {
+            s.read_bool()?;
             let mail = Box::new(read_mail_header(s)?);
+            read_unread(s)?;
             let items = read_slot_pairs(s, s.remaining() / 2)?;
             Ok(E::MailSent { mail, items })
         },
@@ -1242,7 +1327,10 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             return Ok(crate::guild::parse(level, opcode, body)?.map(|g| E::Guild(Box::new(g))));
         }
     };
-    read(&mut PacketStream::from_bytes(body)).map(Some)
+    let mut s = PacketStream::from_bytes(body);
+    let r = read(&mut s).map(Some);
+    crate::sc::note_unread(s.remaining());
+    r
 }
 
 // ---- helpers --------------------------------------------------------------------------------
@@ -1286,8 +1374,9 @@ fn read_str(s: &mut PacketStream) -> Result<Box<str>, MarshalError> {
     Ok(s.read_string()?.into_boxed_str())
 }
 
-/// The four `CountUnreadMail` counters (G/models/char_data.rs:552).
 fn read_unread(s: &mut PacketStream) -> Result<[i32; 4], MarshalError> {
+    // 10.x CountUnreadMail: four totals, then sent, received, MIA and commercial
+    skip(s, 16)?;
     Ok([s.read_i32()?, s.read_i32()?, s.read_i32()?, s.read_i32()?])
 }
 
@@ -1303,11 +1392,13 @@ fn read_slot_pairs(s: &mut PacketStream, n: usize) -> Result<Vec<(u8, u8)>, Mars
 
 /// Detail body length per `ItemDetailType` byte, as the 1.2 client's item detail reader consumes
 /// them (G/models/item.rs:155-167); unknown types read no body.
-const DETAIL_BODY_LENS: [usize; 10] = [0, 55, 29, 6, 9, 24, 16, 16, 8, 4];
+/// Detail body lengths of the fixed-size item detail types (`Item.GetDetailBodyLength`); type 1
+/// (equipment) is variable.
+const DETAIL_BODY_LENS: [usize; 15] = [0, 0, 33, 20, 9, 24, 16, 16, 8, 4, 12, 24, 10, 13, 8];
 
 /// Bytes of `Item.Write` after the detail body: create time (8), lifespan (4), made unit (4),
 /// world (1), unsecure time (8), unpack time (8).
-const ITEM_TAIL_LEN: usize = 33;
+const ITEM_TAIL_LEN: usize = 8 + 4 + 8 + 1 + 8 + 8 + 8;
 
 /// `Item.Write` (G/models/item.rs:1061-1082): `u32 template`, and, unless the template is 0,
 /// `u64 id, u8 grade, u8 flags, i32 count, u8 detail type`, the detail body and the tail.
@@ -1324,7 +1415,12 @@ pub(crate) fn read_item(s: &mut PacketStream) -> Result<ItemBrief, MarshalError>
         count: s.read_i32()?,
     };
     let detail_type = usize::from(s.read_u8()?);
-    skip(s, DETAIL_BODY_LENS.get(detail_type).copied().unwrap_or(0))?;
+    if detail_type == 1 {
+        skip(s, 1 + 2 + 8 + 2 + 2 + 8 + 1 + 1)?;
+        s.read_pisc_w(18)?;
+    } else {
+        skip(s, DETAIL_BODY_LENS.get(detail_type).copied().unwrap_or(0))?;
+    }
     skip(s, ITEM_TAIL_LEN)?;
     Ok(item)
 }
@@ -1332,16 +1428,18 @@ pub(crate) fn read_item(s: &mut PacketStream) -> Result<ItemBrief, MarshalError>
 // ---- quests ---------------------------------------------------------------------------------
 
 /// Size of one `Quest.Write` row.
-const QUEST_ROW_LEN: usize = 76;
+const QUEST_ROW_LEN: usize = 45;
 
 /// `Quest.Write` (G/models/char_data.rs:458-482).
 fn read_quest_row(s: &mut PacketStream) -> Result<QuestRow, MarshalError> {
     let id = s.read_i64()?;
     let template = s.read_u32()?;
     let status = s.read_u8()?;
+    // 10.x: ten objective counters, packed
+    let packed = s.read_pisc_w(10)?;
     let mut objectives = [0; 5];
-    for o in &mut objectives {
-        *o = s.read_i32()?;
+    for (o, v) in objectives.iter_mut().zip(&packed) {
+        *o = *v as i32;
     }
     s.read_bool()?; // isCheckSet
     s.read_bc()?; // obj id
@@ -1376,10 +1474,11 @@ fn quests(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
 }
 
 fn completed_quests(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
-    let n = read_count(s, 10)?;
+    // 10.x: i32 count of (u32 block index, 8-byte bit mask of 64 quests)
+    let n = read_count(s, 12)?;
     let mut ids = Vec::new();
     for _ in 0..n {
-        let block = u32::from(s.read_u16()?);
+        let block = s.read_u32()?;
         let mut mask = s.read_u64()?;
         while mask != 0 {
             ids.push(block * 64 + mask.trailing_zeros());
@@ -1394,15 +1493,17 @@ fn completed_quests(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError>
 /// Member slots of `Team.Write` (the server's `Team::members` has 50).
 const TEAM_SLOTS: usize = 50;
 
-/// `TeamMember.Write` (G/systems/social/packets/team.rs:35-43).
+/// 10.x `TeamMember.Write`: u64 character, str name, race, gender, level, role, bc object, heir
+/// level.
 fn read_team_member(s: &mut PacketStream) -> Result<TeamMemberBrief, MarshalError> {
-    let char_id = s.read_u32()?;
+    let char_id = s.read_u64()? as u32;
     let name = read_str(s)?;
     s.read_u8()?; // race
     s.read_u8()?; // gender
     let level = s.read_u8()?;
     let role = s.read_u8()?;
     let obj_id = s.read_bc()?;
+    s.read_u8()?; // heir level
     Ok(TeamMemberBrief {
         char_id,
         name,
@@ -1412,26 +1513,30 @@ fn read_team_member(s: &mut PacketStream) -> Result<TeamMemberBrief, MarshalErro
     })
 }
 
-/// `Team.Write` head (G/systems/social/packets/team.rs:82-104) and the members after it.
+/// 10.x `SCJoinedTeamPacket`: `Team.Write` (u32 id, u64 owner, bool party, ten u8 party counts,
+/// 50 slots of (u64 character, bool online), twelve marks (u8 type; 1: u64, 2: bc), looting rule
+/// (i8 method, u8 grade, u64 master, bool roll), u32 joint id, bool joint leader, i32 joint order,
+/// u64 0, i8 team role), then the members (`TeamMember.Write`), then bool is mine.
 fn joined_team(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
     let team_id = s.read_u32()?;
-    let owner_id = s.read_u32()?;
+    let owner_id = s.read_u64()? as u32;
     let is_party = s.read_bool()?;
     skip(s, 10)?; // party counts
-    skip(s, TEAM_SLOTS * 5)?; // (u32 character id, bool online) per slot
+    skip(s, TEAM_SLOTS * 9)?; // (u64 character id, bool online) per slot
     for _ in 0..12 {
-        // marks: kind 1 carries a character id, kind 2 an object id
         match s.read_u8()? {
-            1 => skip(s, 4)?,
+            1 => skip(s, 8)?,
             2 => skip(s, 3)?,
             _ => {}
         }
     }
-    skip(s, 7)?; // looting rule: u8 method, u8 grade, u32 master, bool roll
+    skip(s, 1 + 1 + 8 + 1)?; // looting rule
+    skip(s, 4 + 1 + 4 + 8 + 1)?; // joint id, joint leader, joint order, 0, team role
     let mut members = Vec::new();
-    while s.remaining() > 0 && members.len() < TEAM_SLOTS {
+    while s.remaining() > 1 && members.len() < TEAM_SLOTS {
         members.push(read_team_member(s)?);
     }
+    s.read_bool()?; // is mine
     Ok(ActivityEvent::JoinedTeam {
         team_id,
         owner_id,
@@ -1441,40 +1546,37 @@ fn joined_team(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
 }
 
 /// Bytes of one `TeamMember.WritePerson` (G/systems/social/packets/team.rs:46-66).
-const TEAM_PERSON_BYTES: usize = 50;
+const TEAM_PERSON_BYTES: usize = 8 + 8 + 2 + 5 + 11 + 5;
 
-/// `TeamMember.WritePerson`: character id, zone, instance, level, hit points and mana (current and
-/// maximum), the 9-byte position, the object id (`0` offline), then a flag byte, the three
-/// abilities and five reserved bytes that bots do not use.
+/// 10.x `TeamMember.WritePerson`: u64 character, i64 zone, i8 level, i8 heir level, packed (hp,
+/// max hp, mp, max mp), position, three abilities, bool offline, i8 dice bid rule. No object id or
+/// instance id (0).
 fn read_team_person(s: &mut PacketStream) -> Result<TeamPerson, MarshalError> {
-    let char_id = s.read_u32()?;
-    let zone_id = s.read_u32()?;
-    let instance_id = s.read_u32()?;
+    let char_id = s.read_u64()? as u32;
+    let zone_id = s.read_i64()? as u32;
     let level = s.read_u8()?;
-    let hp = s.read_i32()?;
-    let hp_max = s.read_i32()?;
-    let mp = s.read_i32()?;
-    let mp_max = s.read_i32()?;
+    s.read_u8()?; // heir level
+    let v = s.read_pisc_w(4)?;
     let (x, y, z) = s.read_position()?;
-    let obj_id = s.read_bc()?;
-    skip(s, 9)?;
+    skip(s, 3 + 1 + 1)?; // abilities, offline, dice bid rule
     Ok(TeamPerson {
         char_id,
         zone_id,
-        instance_id,
+        instance_id: 0,
         level,
-        hp,
-        hp_max,
-        mp,
-        mp_max,
+        hp: v[0] as i32,
+        hp_max: v[1] as i32,
+        mp: v[2] as i32,
+        mp_max: v[3] as i32,
         pos: [x, y, z],
-        obj_id,
+        obj_id: 0,
     })
 }
 
 /// `SCTeamRemoteMembersEx`: `i32 count` and the members (the count is checked against the bytes
 /// left before anything is allocated).
 fn team_remote_members(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
+    s.read_i32()?; // team id (10.x)
     let count = usize::try_from(s.read_i32()?).unwrap_or(0);
     if count > s.remaining() / TEAM_PERSON_BYTES {
         return Err(MarshalError::EndOfStream {
@@ -1544,12 +1646,20 @@ fn read_mail_header(s: &mut PacketStream) -> Result<MailHeader, MarshalError> {
         receiver: read_str(s)?,
         open_date: s.read_i64()?,
         returned: s.read_bool()?,
-        extra: s.read_i64()?,
+        extra: {
+            let extra = s.read_i64()?;
+            s.read_bool()?; // 10.x trailing flag
+            extra
+        },
     })
 }
 
 /// `MailBody.Write` (G/systems/economy/mail.rs:402-424): the fixed part, then ten item slots
 /// (`Item.Write`, or an `i32 0` for an empty one).
+fn clamp_i32(v: i64) -> i32 {
+    v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
 fn read_mail_body(s: &mut PacketStream) -> Result<MailBodyInfo, MarshalError> {
     let mut body = MailBodyInfo {
         mail_id: s.read_i64()?,
@@ -1557,9 +1667,13 @@ fn read_mail_body(s: &mut PacketStream) -> Result<MailBodyInfo, MarshalError> {
         receiver: read_str(s)?,
         title: read_str(s)?,
         text: read_str(s)?,
-        money: s.read_i32()?,
-        billing: s.read_i32()?,
-        money2: s.read_i32()?,
+        money: clamp_i32(s.read_i64()?),
+        billing: clamp_i32(s.read_i64()?),
+        money2: {
+            let v = clamp_i32(s.read_i64()?);
+            s.read_u32()?; // 0
+            v
+        },
         send_date: s.read_i64()?,
         recv_date: s.read_i64()?,
         open_date: s.read_i64()?,
@@ -1575,8 +1689,10 @@ fn read_mail_body(s: &mut PacketStream) -> Result<MailBodyInfo, MarshalError> {
 }
 
 fn mail_received(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
+    // 10.x SCGotMailPacket: header, unread counts, u64 0, bool has body, body
     let mail = Box::new(read_mail_header(s)?);
     let unread = read_unread(s)?;
+    s.read_u64()?;
     let body = if s.read_bool()? {
         Some(Box::new(read_mail_body(s)?))
     } else {
@@ -1585,18 +1701,17 @@ fn mail_received(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
     Ok(ActivityEvent::MailReceived {
         mail,
         unread,
-        is_cancel: s.read_bool()?,
+        is_cancel: false,
         body,
     })
 }
 
 fn mail_list(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
+    // 10.x: one header per packet: bool is sent, u32 mailbox total, the header, u8 list kind
     let is_sent = s.read_bool()?;
-    let n = read_count(s, MAIL_HEADER_MIN_LEN)?;
-    let mut mails = Vec::with_capacity(n);
-    for _ in 0..n {
-        mails.push(read_mail_header(s)?);
-    }
+    s.read_u32()?; // mailbox total
+    let mails = vec![read_mail_header(s)?];
+    s.read_u8()?; // list kind
     Ok(ActivityEvent::MailList { is_sent, mails })
 }
 
@@ -1604,17 +1719,23 @@ fn attachment_taken(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError>
     let mail_id = s.read_i64()?;
     let money = s.read_bool()?;
     let aa_point = s.read_bool()?;
+    s.read_bool()?; // honor point taken
     let take_sequentially = s.read_bool()?;
+    // 10.x: u8 count, that many item ids, then ten slot pairs
     let n = usize::from(s.read_u8()?).min(MAX_MAIL_ATTACHMENTS);
+    let mut ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        ids.push(s.read_u64()?);
+    }
     let mut items = Vec::with_capacity(n);
     for i in 0..MAX_MAIL_ATTACHMENTS {
-        let item = TakenItem {
-            id: s.read_u64()?,
-            slot_type: s.read_u8()?,
-            slot: s.read_u8()?,
-        };
+        let (slot_type, slot) = (s.read_u8()?, s.read_u8()?);
         if i < n {
-            items.push(item);
+            items.push(TakenItem {
+                id: ids[i],
+                slot_type,
+                slot,
+            });
         }
     }
     Ok(ActivityEvent::AttachmentTaken {

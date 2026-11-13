@@ -235,7 +235,7 @@ impl PacketStream {
     }
 
     pub fn read_position(&mut self) -> Result<(f32, f32, f32)> {
-        let b = self.take_array::<9>()?;
+        let b = self.take_array::<{ crate::pos::POSITION_LEN }>()?;
         Ok(helpers::decode_position(&b))
     }
 
@@ -517,7 +517,7 @@ mod tests {
             (8, |s| s.read_i64().map(|_| ())),
             (8, |s| s.read_u64().map(|_| ())),
             (8, |s| s.read_f64().map(|_| ())),
-            (9, |s| s.read_position().map(|_| ())),
+            (11, |s| s.read_position().map(|_| ())),
         ];
         for &(width, read) in readers {
             for available in 0..width {

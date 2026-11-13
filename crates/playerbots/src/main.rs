@@ -30,7 +30,7 @@ use playerbots::roster::{Roster, SharedRoster};
 use playerbots::secrets::{self, Source};
 use playerbots::supervisor::{ensure_roster, register_slots, Supervisor};
 
-/// Headless ArcheAge 1.2 player bots for the AAEmu Rust server.
+/// Headless ArcheAge 10.0.2.13 player bots for the AAEmu 10.x server.
 #[derive(Parser)]
 #[command(name = "playerbots", version, about)]
 struct Cli {

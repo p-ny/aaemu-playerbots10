@@ -2022,11 +2022,12 @@ mod tests {
         use aa_proto::opcodes::sc as op;
         use aa_proto::sc::ServerEvent;
         use aa_proto::sc_world::ItemChange;
-        // action, 1 task: money -250, no forced removals, the trailing u32
-        let mut body = vec![14u8, 1, 1];
-        body.extend((-250i32).to_le_bytes());
+        // 10.x: action, 1 task (money: action 1, log type, i64 -250), no forced removals, then
+        // the trailing type (i64), lock slot key (i32) and query result (bool)
+        let mut body = vec![14u8, 1, 1, 0];
+        body.extend((-250i64).to_le_bytes());
         body.push(0);
-        body.extend(0u32.to_le_bytes());
+        body.extend([0u8; 8 + 4 + 1]);
         let ev = aa_proto::sc::parse(aa_proto::game::LEVEL_GAME, op::SCTradeMadePacket, &body)
             .unwrap()
             .unwrap();

@@ -5,7 +5,23 @@
 //! and boats; [`crate::sc_activity`] covers quests, duels, trade, teams, houses, mail and
 //! crafting.
 
+use std::cell::Cell;
+
 use crate::stream::MarshalError;
+
+thread_local! {
+    static UNREAD: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn note_unread(n: usize) {
+    UNREAD.with(|u| u.set(n));
+}
+
+/// Bytes the last parser on this thread left unread (layout checks against captured packets:
+/// a correct parser of a packet bots read in full leaves 0).
+pub fn last_unread() -> usize {
+    UNREAD.with(|u| u.get())
+}
 
 pub use crate::sc_activity::ActivityEvent;
 pub use crate::sc_world::WorldEvent;
@@ -20,6 +36,7 @@ pub enum ServerEvent {
 /// [`crate::game`] first). `Ok(None)` when bots do not need the packet; `Err` when the body does
 /// not match the expected layout.
 pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ServerEvent>, MarshalError> {
+    note_unread(0);
     if let Some(e) = crate::sc_world::parse(level, opcode, body)? {
         return Ok(Some(ServerEvent::World(e)));
     }

@@ -503,7 +503,20 @@ impl GearData {
         if table_exists(conn, "item_socket_chances")? {
             each_row(
                 conn,
-                "SELECT num_sockets, success_ratio FROM item_socket_chances",
+                // 10.x: one row per chance table, socket0..socket9 = the chance of the n-th socket
+                if crate::sql::has_column(conn, "item_socket_chances", "num_sockets") {
+                "SELECT num_sockets, success_ratio FROM item_socket_chances"
+            } else {
+                "SELECT n, ratio FROM (SELECT 1 AS n, socket0 AS ratio FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 2, socket1 FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 3, socket2 FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 4, socket3 FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 5, socket4 FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 6, socket5 FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 7, socket6 FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 8, socket7 FROM item_socket_chances WHERE id = 1 \
+                 UNION ALL SELECT 9, socket8 FROM item_socket_chances WHERE id = 1)"
+            },
                 |r| {
                     // keyed by the socket being made (1 = the first gem)
                     let n = r.u32(0) as usize;
@@ -517,8 +530,16 @@ impl GearData {
         if table_exists(conn, "item_grades")? {
             each_row(
                 conn,
+                // 10.x keeps the regrade odds per grade in item_enchant_ratios (group 1 = gear)
+                if crate::sql::has_column(conn, "item_grades", "grade_enchant_success_ratio") {
                 "SELECT id, grade_order, stat_multiplier, grade_enchant_success_ratio, \
-                 grade_enchant_break_ratio, grade_enchant_downgrade_ratio FROM item_grades",
+                 grade_enchant_break_ratio, grade_enchant_downgrade_ratio FROM item_grades"
+            } else {
+                "SELECT g.id, g.grade_order, g.stat_multiplier, \
+                 COALESCE(r.grade_enchant_success_ratio, 0), COALESCE(r.grade_enchant_break_ratio, 0), \
+                 COALESCE(r.grade_enchant_downgrade_ratio, 0) FROM item_grades g \
+                 LEFT JOIN item_enchant_ratios r ON r.grade = g.id AND r.item_enchant_ratio_group_id = 1"
+            },
                 |r| {
                     let id = r.u32(0) as usize;
                     if id < GRADES {
@@ -645,13 +666,20 @@ impl GearData {
 
 /// The equippable templates of the three item class tables, with their `items` columns.
 fn load_items(conn: &Connection) -> Result<IdMap<GearItem>> {
-    const COLS: &str = "i.LEVEL, i.level_requirement, i.fixed_grade, i.char_gender_id, \
-                        i.gradable, i.grade_enchantable";
+    // 1.2 has a separate regrade flag; 10.x regrades every gradable item
+    let regrade = if crate::sql::has_column(conn, "items", "grade_enchantable") {
+        "i.grade_enchantable"
+    } else {
+        "i.gradable"
+    };
+    let cols = format!(
+        "i.LEVEL, i.level_requirement, i.fixed_grade, i.char_gender_id, i.gradable, {regrade}"
+    );
     let sources: [(&str, String, GearClass); 3] = [
         (
             "item_armors",
             format!(
-                "SELECT x.item_id, x.slot_type_id, x.type_id, {COLS} FROM item_armors x \
+                "SELECT x.item_id, x.slot_type_id, x.type_id, {cols} FROM item_armors x \
                  JOIN items i ON i.id = x.item_id"
             ),
             GearClass::Armor,
@@ -659,7 +687,7 @@ fn load_items(conn: &Connection) -> Result<IdMap<GearItem>> {
         (
             "item_weapons",
             format!(
-                "SELECT x.item_id, h.slot_type_id, x.holdable_id, {COLS} FROM item_weapons x \
+                "SELECT x.item_id, h.slot_type_id, x.holdable_id, {cols} FROM item_weapons x \
                  JOIN holdables h ON h.id = x.holdable_id JOIN items i ON i.id = x.item_id"
             ),
             GearClass::Weapon,
@@ -667,7 +695,7 @@ fn load_items(conn: &Connection) -> Result<IdMap<GearItem>> {
         (
             "item_accessories",
             format!(
-                "SELECT x.item_id, x.slot_type_id, x.type_id, {COLS} FROM item_accessories x \
+                "SELECT x.item_id, x.slot_type_id, x.type_id, {cols} FROM item_accessories x \
                  JOIN items i ON i.id = x.item_id"
             ),
             GearClass::Accessory,
@@ -843,7 +871,16 @@ fn load_sold(
     let mut copper: FxHashMap<u32, bool> = FxHashMap::default();
     each_row(
         conn,
-        "SELECT id, price, honor_price, living_point_price FROM items",
+        // 10.x: prices per currency in item_prices (0 = gold; other currencies count as honor or
+        // living points)
+        if crate::sql::has_column(conn, "items", "honor_price") {
+            "SELECT id, price, honor_price, living_point_price FROM items"
+        } else {
+            "SELECT i.id, COALESCE(gp.price, 0), COALESCE(op.price, 0), 0 FROM items i \
+         LEFT JOIN (SELECT item_id, MIN(price) AS price, MIN(refund) AS refund FROM item_prices WHERE currency_id = 0 GROUP BY item_id) gp ON gp.item_id = i.id \
+         LEFT JOIN (SELECT item_id, MAX(price) AS price FROM item_prices WHERE currency_id != 0 \
+         GROUP BY item_id) op ON op.item_id = i.id"
+        },
         |r| {
             let id = r.u32(0);
             if items.contains(id) || gems.contains(id) {

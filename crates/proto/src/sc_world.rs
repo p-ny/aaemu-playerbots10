@@ -53,7 +53,7 @@ pub mod unit_type {
 
 /// Number of equipment slots written by `Character.Write` / `SCUnitStatePacket`
 /// (`EQUIPMENT_CONTAINER_SIZE`, models/container.rs:78).
-const EQUIPMENT_SLOTS: u8 = 28;
+const EQUIPMENT_SLOTS: u8 = 34;
 /// Appearance slots (face .. beard) are written as the template id only (models/container.rs:66).
 const BODY_PART_SLOTS: std::ops::RangeInclusive<u8> = 19..=25;
 /// The backpack slot of the equipment (`equip_slot::BACKPACK`, models/container.rs:73): where a
@@ -77,7 +77,9 @@ pub mod grade_enchant_result {
 
 /// Detail body lengths after the type byte, indexed by `ItemDetailType`
 /// (aaemu-game models/item.rs:158).
-const DETAIL_BODY_LENS: [usize; 10] = [0, 55, 29, 6, 9, 24, 16, 16, 8, 4];
+/// Detail body lengths of the fixed-size item detail types (`Item.GetDetailBodyLength`); type 1
+/// (equipment) is variable (see [`read_detail_body`]).
+const DETAIL_BODY_LENS: [usize; 15] = [0, 0, 33, 20, 9, 24, 16, 16, 8, 4, 12, 24, 10, 13, 8];
 
 // ---- event payloads ------------------------------------------------------------------------
 
@@ -470,6 +472,9 @@ pub enum WorldEvent {
         token: u32,
         /// Stream server port.
         stream_port: u16,
+        /// The server's 260-byte RSA public key blob (`CSAesXorKeyPacket` wraps the session keys
+        /// with it).
+        pub_key: Box<[u8]>,
     },
     /// Proxy `ChangeStatePacket` (packets/proxy.rs:22): the connection state machine step.
     ChangeState(i32),
@@ -1077,7 +1082,10 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<WorldEvent>, 
     let Some(read) = reader(level, opcode) else {
         return Ok(None);
     };
-    read(&mut PacketStream::from_bytes(body))
+    let mut s = PacketStream::from_bytes(body);
+    let r = read(&mut s);
+    crate::sc::note_unread(s.remaining());
+    r
 }
 
 /// Whether [`parse`] handles this packet, so the caller can skip the work for the others. A
@@ -1146,7 +1154,11 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCTargetChangedPacket => read_target_changed,
         sc::SCExpChangedPacket => read_exp_changed,
         sc::SCLevelChangedPacket => read_level_changed,
-        sc::SCCombatEngagedPacket => |s| some(WorldEvent::CombatEngaged { obj: s.read_bc()? }),
+        sc::SCCombatEngagedPacket => |s| {
+            let obj = s.read_bc()?;
+            s.read_bc()?; // the other unit
+            some(WorldEvent::CombatEngaged { obj })
+        },
         sc::SCCombatClearedPacket => |s| some(WorldEvent::CombatCleared { obj: s.read_bc()? }),
         sc::SCUnitFactionChangedPacket => read_faction_changed,
         // zone conflicts, pvp
@@ -1213,6 +1225,28 @@ pub(crate) fn some(event: WorldEvent) -> Res<Option<WorldEvent>> {
     Ok(Some(event))
 }
 
+/// The actor flags (`u16`) of a `UnitMoveType` and the optional parts they announce, in the order
+/// the server reads them (`UnitMoveType.Read`).
+pub(crate) fn skip_actor_extensions(s: &mut PacketStream) -> Res<()> {
+    let actor = s.read_u16()?;
+    if actor & 0x80 != 0 {
+        skip(s, 2)?; // fall velocity
+    }
+    if actor & 0x20 != 0 {
+        skip(s, 1 + 2 + 2 + 11 + 3)?; // ground contact part, local position and rotation
+    }
+    if actor & 0x60 != 0 {
+        skip(s, 4)?; // ground contact object
+    }
+    if actor & 0x40 != 0 || actor & 0x8000 != 0 {
+        skip(s, 4)?; // climb data
+    }
+    if actor & 0x100 != 0 {
+        skip(s, 4)?; // max pushed unit
+    }
+    Ok(())
+}
+
 // ---- yaw helpers ---------------------------------------------------------------------------
 
 /// Radians of a `SCUnitStatePacket` signed-byte yaw (`v / 127` of a turn,
@@ -1265,20 +1299,24 @@ fn skip_sized(s: &mut PacketStream) -> Res<()> {
     skip(s, n)
 }
 
-/// `UnitCustomModelParams` (models/unit_model.rs:143): a kind byte gates the following blocks.
+/// `UnitCustomModelParams` (10.x): ext type, then hair (ext >= 1), body (>= 2) and face (>= 3).
 fn skip_model_params(s: &mut PacketStream) -> Res<()> {
-    let kind = s.read_u8()?;
-    if kind >= 1 {
-        skip(s, 4)?; // hair color
+    let ext = s.read_u8()?;
+    if ext >= 1 {
+        // race, gender, visual race expiry, visual race, visual gender, hair color, horn color,
+        // hair color id, two-tone hair color, two floats
+        skip(s, 1 + 1 + 8 + 1 + 1 + 4 * 4 + 4 * 2)?;
     }
-    if kind >= 2 {
-        skip(s, 8)?; // skin color, model id
+    if ext >= 2 {
+        skip(s, 4 * 4)?; // skin color, body diffuse and normal maps, body weight
     }
-    if kind >= 3 {
-        // FaceModel (models/unit_model.rs:83): 20 bytes of movable decal, 4 fixed decals of 8,
-        // three map ids, the normal map weight, five colors, then the sized modifier blob.
-        skip(s, 20 + 32 + 12 + 4 + 20)?;
-        skip_sized(s)?;
+    if ext >= 3 {
+        skip(s, 4 + 4 * 3 + 2 * 2)?; // movable decal asset, weight, scale, rotate, move x/y
+        s.read_pisc_w(6)?; // fixed decal assets
+        s.read_pisc_w(3)?; // diffuse, normal, eyelash maps
+        skip(s, 4 * 7)?; // six decal weights, normal map weight
+        skip(s, 4 * 5)?; // lip, two pupils, eyebrow, deco colors
+        skip_sized(s)?; // face-maker modifier
     }
     Ok(())
 }
@@ -1295,43 +1333,40 @@ struct ItemRec {
     gems: u8,
 }
 
-/// `ItemDetailType.Equipment`: the detail block of gear (models/item.rs:24).
+/// `ItemDetailType.Equipment`: the detail block of gear (`EquipItem.WriteDetails`).
 const DETAIL_EQUIPMENT: u8 = 1;
-/// Where the seven gem template ids start in the equipment detail body (after the image item,
-/// durability, an `i16`, the lunastone, the charge time and the dye: `4 + 1 + 2 + 4 + 8 + 4`,
-/// models/item.rs:603 `write_details`).
-const GEMS_AT: usize = 23;
-/// Gem slots of an equipment detail (`gem_ids: [u32; 7]`).
-const GEM_SLOTS: usize = 7;
+/// The socket slots in the equipment detail's 18 packed values (`EquipItem`: slot 0 the image
+/// item, 4..13 the gems).
+const GEM_SLOTS: std::ops::Range<usize> = 4..13;
 
-/// The number of socketed gems in an equipment detail body (the non-zero gem ids); 0 when the
-/// body is too short.
+/// The number of socketed gems in an equipment detail body (after its type byte); 0 when the body
+/// does not decode.
 fn gems_in(body: &[u8]) -> u8 {
-    body.get(GEMS_AT..GEMS_AT + GEM_SLOTS * 4).map_or(0, |b| {
-        b.as_chunks::<4>()
-            .0
-            .iter()
-            .filter(|c| c.iter().any(|&x| x != 0))
-            .count() as u8
-    })
+    read_detail_body(&mut PacketStream::from_bytes(body), DETAIL_EQUIPMENT).unwrap_or(0)
 }
 
 /// Reads the detail body of `detail` type and returns the gems of an equipment detail.
 fn read_detail_body(s: &mut PacketStream, detail: u8) -> Res<u8> {
+    if detail == DETAIL_EQUIPMENT {
+        // durability, charge count, charge time, enchant scale, evolve chance, charge proc time,
+        // mapping fail bonus, element level, then 18 packed values
+        skip(s, 1 + 2 + 8 + 2 + 2 + 8 + 1 + 1)?;
+        let packed = s.read_pisc_w(18)?;
+        return Ok(packed[GEM_SLOTS].iter().filter(|&&v| v != 0).count() as u8);
+    }
     let Some(&len) = DETAIL_BODY_LENS.get(usize::from(detail)) else {
         return invalid(format!("unknown item detail type {detail}"));
     };
-    if detail != DETAIL_EQUIPMENT {
-        skip(s, len)?;
-        return Ok(0);
-    }
-    let at = s.pos();
     skip(s, len)?;
-    Ok(gems_in(&s.as_bytes()[at..at + len]))
+    Ok(0)
 }
 
-/// `Item.Write` (models/item.rs:1061) after the template id: id, grade, flags, count, the typed
-/// detail block, create time, lifespan, made unit, world id, unsecure and unpack times.
+/// Bytes of `Item.Write` after the detail body: create time (8), lifespan (4), made unit (8),
+/// world (1), unsecure time (8), unpack time (8), charge-use skill time (8).
+pub(crate) const ITEM_TAIL_LEN: usize = 8 + 4 + 8 + 1 + 8 + 8 + 8;
+
+/// `Item.Write` after the template id: id, grade, flags, count, the typed detail block and the
+/// tail ([`ITEM_TAIL_LEN`]).
 fn read_item_body(s: &mut PacketStream, template: u32) -> Res<ItemRec> {
     let id = s.read_u64()?;
     let grade = s.read_u8()?;
@@ -1339,7 +1374,7 @@ fn read_item_body(s: &mut PacketStream, template: u32) -> Res<ItemRec> {
     let count = s.read_i32()?;
     let detail = s.read_u8()?;
     let gems = read_detail_body(s, detail)?;
-    skip(s, 8 + 4 + 4 + 1 + 8 + 8)?; // create time, lifespan, made unit, world id, unsecure, unpack
+    skip(s, ITEM_TAIL_LEN)?;
     Ok(ItemRec {
         template,
         id,
@@ -1365,10 +1400,15 @@ struct EquipOut {
     gems: Vec<u8>,
 }
 
-/// The equipment block of `Character.Write` (models/character.rs:449): 28 slots, appearance
-/// parts (19..=25) carry the template only.
+/// `EquipmentSerializer.Write` of a character: a `u64` mask of the occupied slots (34), the
+/// occupied slots in order (appearance parts 19..=25 as a template id, the rest as `Item.Write`),
+/// then the `u64` random-attribute activation mask.
 fn read_character_equipment(s: &mut PacketStream, mut out: Option<&mut EquipOut>) -> Res<()> {
+    let valid = s.read_u64()?;
     for slot in 0..EQUIPMENT_SLOTS {
+        if valid & (1 << slot) == 0 {
+            continue;
+        }
         let template = s.read_u32()?;
         if template == 0 {
             continue;
@@ -1389,6 +1429,7 @@ fn read_character_equipment(s: &mut PacketStream, mut out: Option<&mut EquipOut>
             out.gems.push(gems);
         }
     }
+    s.read_u64()?; // random attribute activation mask
     Ok(())
 }
 
@@ -1416,21 +1457,23 @@ struct CharRecord {
 }
 
 /// A lower bound of one record's size, to reject absurd list counts.
-const MIN_CHAR_RECORD: usize = 150;
+const MIN_CHAR_RECORD: usize = 200;
 
-/// Reads one complete `Character.Write` record. The list has no entry lengths, so every byte
-/// must be consumed: stopping after the name would parse the next character from equipment bytes.
+/// Reads one complete `Character.WriteLobby1013` record. The list has no entry lengths, so every
+/// byte must be consumed: stopping after the name would parse the next character from equipment
+/// bytes.
 fn read_character_record(
     s: &mut PacketStream,
     equipment: Option<&mut EquipOut>,
 ) -> Res<CharRecord> {
-    let id = s.read_u32()?;
+    let id = s.read_i64()? as u32;
     let name = s.read_string()?;
     let race = s.read_u8()?;
     let gender = s.read_u8()?;
     let level = s.read_u8()?;
-    let hp = s.read_i32()?;
-    let mp = s.read_i32()?;
+    skip(s, 8)?; // heir exp
+    let hp = s.read_u32()? as i32;
+    let mp = s.read_u32()? as i32;
     let zone = s.read_u32()?;
     let faction = s.read_u32()?;
     s.read_string()?; // faction name
@@ -1442,19 +1485,22 @@ fn read_character_record(
     let y = convert_long_to_coord(s.read_i64()?);
     let z = s.read_f32()?;
     skip_model_params(s)?;
-    let labor = s.read_i16()?;
-    // labor modified (8), dead count (2), dead time (8), rez wait (4), rez time (8), rez penalty
-    // (4), last world leave (8)
-    skip(s, 8 + 2 + 8 + 4 + 8 + 4 + 8)?;
+    // dead count (2), dead time (8), rez wait (4), special rez wait (4), rez time (8), rez
+    // penalty (4), last world leave (8)
+    skip(s, 2 + 8 + 4 + 4 + 8 + 4 + 8)?;
     let money = s.read_i64()?;
-    // money amount (8), crime (2), infamy (4), trials (2), delete request (8), transfer request
-    // (8), delete delay (8), consumed labor (4)
-    skip(s, 8 + 2 + 4 + 2 + 8 + 8 + 8 + 4)?;
-    let loyalty = s.read_i64()?;
+    // AA point (8), crime point (2), crime record (4), crime score (2), delete request (8),
+    // transfer request (8), created (8), delete delay (8)
+    skip(s, 8 + 2 + 4 + 2 + 8 + 8 + 8 + 8)?;
     let bank_money = s.read_i64()?;
-    // money amount (8), auto AA point (1), prev point (4), point (4), gift (4), updated (8),
+    // bank AA point (8), auto AA point (1), prev point (4), point (4), gift (4), updated (8),
     // force name change (1)
     skip(s, 8 + 1 + 4 + 4 + 4 + 8 + 1)?;
+    skip_sized(s)?; // 16-byte guid
+    let labor = s.read_u32()?.min(i16::MAX as u32) as i16;
+    // local labor (4), consumed (4), labor updated (8), bm point (8), recharged (4), recharge
+    // reset time (8)
+    skip(s, 4 + 4 + 8 + 8 + 4 + 8)?;
     Ok(CharRecord {
         id,
         name,
@@ -1471,7 +1517,7 @@ fn read_character_record(
         pos: (x, y, z),
         labor,
         money,
-        loyalty,
+        loyalty: 0,
         bank_money,
     })
 }
@@ -1483,15 +1529,30 @@ fn read_change_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 }
 
 fn read_enter_world_response(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    // reason u16, stream token u32, stream port u16, server time u64, tz u32, u16 key size,
+    // key blob (u16 length + bytes), nat addr u32, nat port u16, authority u32 (GM level | 1).
     let reason = s.read_i16()?;
-    let gm = s.read_bool()?;
+    if reason != 0 || s.remaining() == 0 {
+        return some(WorldEvent::EnterWorldResponse {
+            reason,
+            gm: false,
+            token: 0,
+            stream_port: 0,
+            pub_key: Box::default(),
+        });
+    }
     let token = s.read_u32()?;
     let stream_port = s.read_u16()?;
+    skip(s, 8 + 4 + 2)?; // server time, tz, key size
+    let pub_key = s.read_bytes_sized()?.into_boxed_slice();
+    skip(s, 4 + 2)?; // nat addr, nat port
+    let authority = s.read_u32()?;
     some(WorldEvent::EnterWorldResponse {
         reason,
-        gm,
+        gm: authority >= 100,
         token,
         stream_port,
+        pub_key,
     })
 }
 
@@ -1514,8 +1575,9 @@ fn read_character_list(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 }
 
 fn read_character_created(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
-    // Only the id and the name: the record behind them is the same as in the list.
-    let id = s.read_u32()?;
+    // Only the id and the name: the record behind them is the same as in the list
+    // (`WriteLobby1013`: i64 id).
+    let id = s.read_i64()? as u32;
     let name = boxed(s.read_string()?);
     some(WorldEvent::CharacterCreated { id, name })
 }
@@ -1528,21 +1590,38 @@ fn read_character_create_failed(s: &mut PacketStream) -> Res<Option<WorldEvent>>
 
 fn read_character_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     // world/unit_state.rs:43
+    // SCCharacterStatePacket (10.x): iid, guid, rwd, srwd, the lobby record, angles, exp, ...
     let instance_id = s.read_u32()?;
     skip_sized(s)?; // guid
-    skip(s, 4)?; // rwd
+    skip(s, 4 + 4)?; // rwd, srwd
     let mut equipment = EquipOut::default();
     let c = read_character_record(s, Some(&mut equipment))?;
-    s.read_f32()?; // rot x
-    s.read_f32()?; // rot y
+    s.read_f32()?; // angle x
+    s.read_f32()?; // angle y
     let yaw = s.read_f32()?;
-    let exp = s.read_i32()?;
-    let recoverable_exp = s.read_i32()?;
-    // penaltied exp (4), return district id (4), return district (4), resurrection district (4),
-    // ability exp (11 x 4, always zero on the Rust server), unread mail (3 x 4)
-    skip(s, 4 + 4 + 4 + 4 + 44 + 12)?;
+    let exp = s.read_u32()? as i32;
+    skip(s, 8)?; // heir exp
+    let recoverable_exp = s.read_u32()? as i32;
+    // penaltied exp, return district id, return district type, resurrection district type,
+    // ability exp (30), mail totals (4), unread mail (3)
+    skip(s, 4 + 4 + 4 + 4 + 30 * 4 + 4 * 4 + 3 * 4)?;
     let bag_slots = s.read_u8()?;
     let bank_slots = s.read_i16()?;
+    // money (4 x 8), auto AA point, 0, jury point, jail, reported, suspected, play time (6 x 4),
+    // expanded expert, remaining bot checks, failed bot checks, instant times (12 x 8), daily
+    // leadership point + time, daily honor war point + date, reported bad users, usable
+    // ability-set slots
+    skip(
+        s,
+        4 * 8 + 1 + 4 * 6 + 1 + 1 + 2 + 12 * 8 + 4 + 8 + 4 + 8 + 4 + 1,
+    )?;
+    skip_bless_uthstin(s)?;
+    skip(s, 4 + 4)?; // unit state type, appellation stamp
+    skip_equip_slot_reinforces(s)?;
+    skip(s, 1)?; // reserved quest drop target
+    let limits = s.read_u32()? as usize;
+    check_count(s, limits, 9, "merchant purchase")?;
+    skip(s, limits * 9 + 4 + 4)?; // purchases, 0, additional skill points
     some(WorldEvent::CharacterState(Box::new(OwnState {
         id: c.id,
         name: boxed(c.name),
@@ -1627,72 +1706,74 @@ enum EquipLayout {
     BodyOnly,
 }
 
-fn equip_layout(unit_type: u8) -> EquipLayout {
-    match unit_type {
-        unit_type::NPC => EquipLayout::Npc,
-        unit_type::SLAVE => EquipLayout::Slave,
-        unit_type::TRANSFER | unit_type::SHIPYARD => EquipLayout::BodyOnly,
-        _ => EquipLayout::Full,
-    }
-}
-
-/// Reads (and mostly skips) the equipment block of a unit; returns the template in the backpack
-/// slot ([`BACKPACK_SLOT`]), 0 when it is empty or the layout has no such slot.
-fn read_unit_equipment(s: &mut PacketStream, layout: EquipLayout) -> Res<u32> {
+/// `EquipmentSerializer.Write` of a unit (10.x): a `u64` mask of the occupied slots (34), then the
+/// occupied slots: appearance parts 19..=25 as a template id (all units but slaves); for NPCs the
+/// cosplay slot 27 and 31..=33 as `Item.Write` and every other slot compact (`u32 template, u64
+/// id, u8 grade`); for characters, slaves, houses and mates `Item.Write`. Characters end with the
+/// `u64` random-attribute mask. Returns the backpack template of a character.
+fn read_unit_equipment(s: &mut PacketStream, unit_type: u8) -> Res<u32> {
     let mut backpack = 0;
+    let valid = s.read_u64()?;
     for slot in 0..EQUIPMENT_SLOTS {
-        let body_part = BODY_PART_SLOTS.contains(&slot);
-        if body_part && layout != EquipLayout::Slave {
-            skip(s, 4)?;
-            continue;
-        }
-        if layout == EquipLayout::BodyOnly {
-            if slot == 27 {
-                break; // the writer returns before the cosplay slot
-            }
+        if valid & (1 << slot) == 0 {
             continue;
         }
         let template = s.read_u32()?;
+        if BODY_PART_SLOTS.contains(&slot) && unit_type != unit_type::SLAVE {
+            continue;
+        }
         if template == 0 {
             continue;
         }
-        if slot == BACKPACK_SLOT && layout == EquipLayout::Full {
+        match unit_type {
+            unit_type::NPC if slot != 27 && !(31..=33).contains(&slot) => skip(s, 8 + 1)?,
+            unit_type::NPC
+            | unit_type::CHARACTER
+            | unit_type::SLAVE
+            | unit_type::HOUSING
+            | unit_type::MATE => {
+                read_item_body(s, template)?;
+            }
+            _ => {}
+        }
+        if slot == BACKPACK_SLOT {
             backpack = template;
         }
-        if layout == EquipLayout::Npc && slot != 27 {
-            skip(s, 8 + 1)?; // id, grade
-        } else {
-            read_item_body(s, template)?;
-        }
+    }
+    if unit_type == unit_type::CHARACTER {
+        s.read_u64()?; // random attribute activation mask
     }
     Ok(backpack)
 }
 
-/// `SCUnitStatePacket` (world/unit_state.rs:108 characters, :413 other kinds).
 fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    // UnitStateWireSerializer: identity, placement, appearance, relation, gameplay, character;
+    // then the buff lists (NPCs: three empty counts).
     let obj = s.read_bc()?;
     let name = s.read_string()?;
+    skip(s, 1 + 1 + 1)?; // world id, region id, in global world
     let ty = s.read_u8()?;
     let mut tl_id = 0;
     let mut owner_id = 0;
     let id = match ty {
         unit_type::CHARACTER => {
-            let id = s.read_u32()?;
-            skip(s, 8)?;
+            let id = s.read_u64()? as u32;
+            skip(s, 8)?; // identity value
             id
         }
         unit_type::NPC => {
             skip(s, 3)?; // object id again
             let template = s.read_u32()?;
-            owner_id = s.read_u32()?;
-            skip(s, 1)?; // client driven
+            owner_id = s.read_u64()? as u32;
+            skip(s, 1)?; // unit state flag
             template
         }
         unit_type::SLAVE => {
-            skip(s, 4)?; // slave db id
+            skip(s, 8)?; // slave db id
             tl_id = s.read_u16()?;
             let template = s.read_u32()?;
-            owner_id = s.read_u32()?; // summoner character id
+            owner_id = s.read_u64()? as u32; // summoner character id
+            skip(s, 1)?; // master world id
             template
         }
         unit_type::HOUSING => {
@@ -1708,7 +1789,7 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         unit_type::MATE => {
             tl_id = s.read_u16()?;
             let template = s.read_u32()?;
-            owner_id = s.read_u32()?;
+            owner_id = s.read_u64()? as u32;
             template
         }
         unit_type::SHIPYARD => {
@@ -1722,12 +1803,13 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let pos = s.read_position()?;
     skip(s, 4)?; // scale
     let level = s.read_u8()?;
+    skip(s, 1 + 2 + 4)?; // heir level, level block, slot selectors
     skip(s, 4)?; // model id
-    let backpack = read_unit_equipment(s, equip_layout(ty))?;
+    let backpack = read_unit_equipment(s, ty)?;
     skip_model_params(s)?;
-    skip(s, 3)?; // bc(0)
-    let hp = s.read_i32()? / POINTS_SCALE;
-    let mp = s.read_i32()? / POINTS_SCALE;
+    skip(s, 3)?; // target
+    let hp = (s.read_u64()? / POINTS_SCALE as u64) as i32;
+    let mp = (s.read_u64()? / POINTS_SCALE as u64) as i32;
     let mut unit = UnitInfo {
         obj,
         unit_type: ty,
@@ -1754,77 +1836,75 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         },
         complete: false,
     };
-    // The tail is best effort: a character packet the server truncated, or a layout drift, keeps
-    // what was read so far instead of losing the unit.
+    // The tail is best effort: a layout drift keeps what was read so far instead of losing the
+    // unit.
     unit.complete = read_unit_tail(s, &mut unit).is_ok() && s.remaining() == 0;
     some(WorldEvent::UnitState(Box::new(unit)))
 }
 
-/// Everything after hp/mp of `SCUnitStatePacket`: attach points, posture, skills, yaw, factions,
-/// flags, the character-only ability/visual block and the three buff lists.
 fn read_unit_tail(s: &mut PacketStream, unit: &mut UnitInfo) -> Res<()> {
     let ty = unit.unit_type;
-    // AttachPoint1
-    match ty {
-        unit_type::SLAVE => {
-            if s.read_i8()? > -1 {
-                skip(s, 3)?; // owner object
-            }
-        }
-        unit_type::TRANSFER => {
-            if s.read_u8()? != 255 {
-                skip(s, 3)?; // bonding object
-            }
-        }
-        _ => skip(s, 1)?,
+    // attachment: -1, or an attach point and the parent object
+    if s.read_i8()? != -1 {
+        skip(s, 3)?;
     }
-    // AttachPoint2: -1 (one byte), a bond doodad (characters) or a bonding object (slaves).
-    if s.read_u8()? != 0xFF {
-        match ty {
-            unit_type::CHARACTER => skip(s, 12)?, // bc owner, kind, space, spot
-            unit_type::SLAVE => skip(s, 2)?,      // rest of the bc object id
-            _ => {}
-        }
+    // bonding: -1, or a bond doodad (attach point, owner, space, spot, kind)
+    if s.read_i8()? != -1 {
+        skip(s, 3 + 4 + 4 + 4)?;
     }
-    // Unit.ModelPosture (world/unit_state.rs:375)
+    // model posture
     let posture = s.read_u8()?;
     unit.has_loot = s.read_bool()?;
-    if ty != unit_type::CHARACTER {
-        match posture {
-            1 => skip(s, 8)?,  // house doors and windows
-            4 => skip(s, 5)?,  // actor model state: anim id + flag
-            7 => skip(s, 14)?, // farm field state
-            8 => skip(s, 8)?,  // turret pitch and yaw
-            _ => {}
-        }
+    match posture {
+        1 => skip(s, 1)?,             // house openings
+        4 => skip(s, 4 + 1)?,         // actor model state: anim id + activate
+        7 => skip(s, 4 + 4 + 4 + 1)?, // farm field state
+        8 => skip(s, 4 + 4)?,         // turret pitch and yaw
+        _ => {}
     }
+    // UnitStateGameplaySerializer
     skip(s, 1)?; // active weapon
     let skill_count = usize::from(s.read_u8()?);
-    check_count(s, skill_count, 5, "skill")?;
-    let mut skills = Vec::with_capacity(skill_count);
-    for _ in 0..skill_count {
-        skills.push((s.read_u32()?, s.read_u8()?));
+    let passive_count = usize::from(s.read_u8()?);
+    skip(s, 4 + 4 + 4 + 1)?; // unit state type, appellation stamp, vehicle dyeing, temp faction
+    let skills = s.read_pisc_w(skill_count)?;
+    unit.skills = skills.iter().map(|&id| (id as u32, 1)).collect();
+    s.read_pisc_w(passive_count)?;
+    if ty == unit_type::HOUSING {
+        skip(s, 4)?; // rotation z (float)
+    } else {
+        skip(s, 2)?; // roll, pitch
+        unit.yaw = s.read_i8()?;
     }
-    unit.skills = skills.into_boxed_slice();
-    let passive = usize::try_from(s.read_i32()?).unwrap_or(0);
-    check_count(s, passive, 4, "passive buff")?;
-    skip(s, passive * 4)?;
-    skip(s, 2)?; // roll, pitch
-    unit.yaw = s.read_i8()?;
     skip(s, 1)?; // race/gender
-    s.read_pisc_w(4)?; // appellations
-    let factions = s.read_pisc_w(4)?;
-    unit.faction_id = factions[0] as u32;
-    unit.expedition_id = factions[1] as u32;
-    s.read_pisc_w(2)?; // honor, hostile kills
-    skip(s, 2)?; // flags
+    s.read_pisc_w(4)?; // plot debug level, reserved, reserved, appellation
+    let packed = s.read_pisc_w(3)?; // active plot, keep mana regen, faction
+    unit.faction_id = packed[2] as u32;
+    s.read_pisc_w(4)?; // equipment public, offline, duel object, honor in combat
+    if ty == unit_type::NPC {
+        skip(s, 2 + 1)?;
+    } else {
+        let flags = s.read_u16()?;
+        skip(s, 1)?; // attack faction flags
+        if flags & (1 << 8) != 0 {
+            skip(s, 3 + 4)?; // first hitter object and team
+        }
+        if flags & (1 << 7) != 0 {
+            skip(s, 4 * 2)?; // high ability values
+        }
+        if flags & (1 << 6) != 0 {
+            skip(s, 9)?; // GM mode values
+        }
+    }
     if ty == unit_type::CHARACTER {
-        skip(s, 10 * 5)?; // abilities: exp + order
+        skip(s, 29 * 5)?; // expertise: exp + order
         let active = usize::from(s.read_u8()?);
         skip(s, active)?;
-        skip(s, 3)?; // bc(0)
-        skip(s, 6 + 4)?; // visual option stp + four flags
-        skip(s, 4 + 6 * 4)?; // premium, six pStat
+        skip(s, 3 + 1 + 1)?; // duel object, duel team, camp
+        skip(s, 6 + 1 + 1)?; // visual options: stp, flags, cosplay visual
+        skip(s, 4)?; // premium grade
+        skip_bless_uthstin(s)?;
+        skip_equip_slot_reinforces(s)?;
     }
     let mut buffs = Vec::new();
     for list in 0..3u8 {
@@ -1837,35 +1917,53 @@ fn read_unit_tail(s: &mut PacketStream, unit: &mut UnitInfo) -> Res<()> {
     Ok(())
 }
 
+/// `BlessUthstinRules.WritePageInfos`: `i32` page count, pages of seven `i32`, then the selected
+/// page, the extended maximum and the extension count (`i32` each).
+pub(crate) fn skip_bless_uthstin(s: &mut PacketStream) -> Res<()> {
+    let pages = usize::try_from(s.read_i32()?).unwrap_or(0);
+    check_count(s, pages, 28, "bless uthstin page")?;
+    skip(s, pages * 28 + 12)
+}
+
+/// `CharacterEquipSlotReinforces.WriteInfos`: `u32` count of (`i32` slot, `u8` level, `i32` exp),
+/// then `u32` count of (`u8` slot, `i8` trigger level, `u32` modifier).
+pub(crate) fn skip_equip_slot_reinforces(s: &mut PacketStream) -> Res<()> {
+    let slots = s.read_u32()? as usize;
+    check_count(s, slots, 9, "reinforced slot")?;
+    skip(s, slots * 9)?;
+    let effects = s.read_u32()? as usize;
+    check_count(s, effects, 6, "reinforce effect")?;
+    skip(s, effects * 6)
+}
+
 /// `SkillCaster.Write` (systems/skills/types.rs:105): returns the caster's object id.
 fn read_skill_caster(s: &mut PacketStream) -> Res<u32> {
     let kind = s.read_u8()?;
     let obj = s.read_bc()?;
     match kind {
         0 | 1 | 4 => {}
-        2 => skip(s, 8 + 4 + 1 + 4)?, // item id, template, type1, type2
+        2 => skip(s, 8 + 4 + 1 + 8)?, // item id, template, type1, type2 (u64)
         3 => skip(s, 4)?,             // mount skill template
         other => return invalid(format!("SkillCasterType {other} out of range")),
     }
     Ok(obj)
 }
 
-/// `Buff.write_net` (models/buff.rs:146), one entry of the unit-state buff lists.
+/// One buff record of a unit state (`UnitStateBuffSerializer.WriteRecord`): `i32` index, the
+/// skill caster, `u64` caster id, `u8` caster level, `u16` ability level, packed (duration,
+/// elapsed, tick, tick index), packed (buff id, stack, charge, source skill).
 fn read_net_buff(s: &mut PacketStream, list: u8) -> Res<BuffInfo> {
     let index = s.read_u32()?;
-    let buff_id = s.read_u32()?;
     read_skill_caster(s)?;
-    skip(s, 4 + 1 + 2)?; // caster id, caster level, ability level
-    let duration_ms = s.read_i32()?;
-    skip(s, 4 + 4 + 4 + 4)?; // elapsed, tick, tick index, stack
-    let charge = s.read_i32()?;
-    skip(s, 4)?; // cooldown skill
+    skip(s, 8 + 1 + 2)?; // caster id, caster level, ability level
+    let times = s.read_pisc_w(4)?;
+    let ids = s.read_pisc_w(4)?;
     Ok(BuffInfo {
         list,
         index,
-        buff_id,
-        duration_ms,
-        charge,
+        buff_id: ids[0] as u32,
+        duration_ms: times[0] as i32,
+        charge: ids[2] as i32,
     })
 }
 
@@ -1894,12 +1992,14 @@ fn read_unit_moved(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let pos = s.read_position()?;
     let (mut yaw, mut stance) = (0, 0);
     if kind == 1 {
-        // UnitMove (models/movement.rs:417): velocity 3 x i16, rotation 3 x i8, delta movement
-        // 3 x i8, stance, alertness.
+        // UnitMoveType: velocity 3 x i16, rotation 3 x i8, delta movement 3 x i8, stance,
+        // alertness, u16 actor flags and its optional extensions.
         skip(s, 6 + 2)?;
         yaw = s.read_i8()?;
         skip(s, 3)?;
         stance = s.read_u8()?;
+        skip(s, 1)?; // alertness
+        skip_actor_extensions(s)?;
     }
     some(WorldEvent::UnitMoved {
         obj,
@@ -1914,13 +2014,14 @@ fn read_teleport_unit(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let reason = s.read_u8()?;
     let error = s.read_i16()?;
     let pos = s.read_position()?;
+    s.read_f32()?; // second z
     some(WorldEvent::TeleportUnit { reason, error, pos })
 }
 
 fn read_unit_points(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let obj = s.read_bc()?;
-    let hp = s.read_i32()? / POINTS_SCALE;
-    let mp = s.read_i32()? / POINTS_SCALE;
+    let hp = (s.read_i64()? / i64::from(POINTS_SCALE)) as i32;
+    let mp = (s.read_i64()? / i64::from(POINTS_SCALE)) as i32;
     some(WorldEvent::UnitPoints { obj, hp, mp })
 }
 
@@ -1939,15 +2040,19 @@ fn read_unit_damaged(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     match s.read_u8()? {
         0 | 1 | 4 => skip(s, 3)?, // unit, unk1, doodad object id
         2 => {
-            // item: object id then item id, template, type1, type2
-            skip(s, 3 + 8 + 4 + 1 + 4)?;
+            // item: object id then item id, template, type1, type2 (u64)
+            skip(s, 3 + 8 + 4 + 1 + 8)?;
         }
         3 => skip(s, 3 + 4)?, // mount: object id, mount skill template
         other => return invalid(format!("SkillCasterType {other} out of range")),
     }
     let caster = s.read_bc()?;
     let target = s.read_bc()?;
-    skip(s, 1 + 3 + 3 + 5)?; // crime state, damage/absorbed/mana PISC groups, hit tail
+    skip(s, 1)?; // crime state
+    s.read_pisc_w(2)?; // damage, absorbed
+    s.read_pisc_w(3)?; // 0, 0, mana burn
+                       // holdable, element damage, show element, element type, hit type, flag, result
+    skip(s, 1 + 4 + 1 + 4 + 2 + 1 + 1)?;
     some(WorldEvent::UnitDamaged { caster, target })
 }
 
@@ -1955,9 +2060,14 @@ fn read_unit_death(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let obj = s.read_bc()?;
     let reason = s.read_u8()?;
     let respawn_wait_ms = s.read_i32()?;
+    skip(s, 4 + 4)?; // special and auto resurrection waiting times
     let lost_exp = s.read_i32()?;
     skip(s, 1)?; // durability loss rate
     let killer = s.read_bc()?;
+    if killer != 0 && s.remaining() > 0 {
+        skip(s, 1 + 2 + 1 + 1 + 4)?; // game type, kill streak, param1, param2, type
+        s.read_string()?; // killer name
+    }
     some(WorldEvent::UnitDeath {
         obj,
         killer,
@@ -1983,6 +2093,7 @@ fn read_target_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 fn read_exp_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let obj = s.read_bc()?;
     let delta = s.read_i32()?;
+    skip(s, 1)?; // should add ability exp
     some(WorldEvent::ExpChanged { obj, delta })
 }
 
@@ -2054,6 +2165,7 @@ fn read_conflict_zone_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let zone_group = s.read_u16()?;
     let state = s.read_u8()?;
     let end_unix_s = s.read_i64()?;
+    s.read_i64()?; // lock time
     some(WorldEvent::ConflictZoneState {
         zone_group,
         state,
@@ -2061,12 +2173,12 @@ fn read_conflict_zone_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     })
 }
 
-/// `SCUnitEquipmentsChangedPacket` (systems/economy/item_packets.rs:64): `bc obj, u8 count`, then
-/// per slot `u8 slot` and an item (`Item.Write`, or the 4-byte empty form).
+/// 10.x: bc unit, u8 count, bool char transform, per entry (i8 slot, `Item.Write` or `u32 0`),
+/// then a `u64` mask of the entries that hold an item.
 fn read_unit_equipments_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let obj = s.read_bc()?;
     let count = usize::from(s.read_u8()?);
-    // (a slot is at least 5 bytes: the slot and the empty item)
+    s.read_bool()?; // char transform
     check_count(s, count, 5, "equipment slot")?;
     let mut slots = SmallVec::new();
     for _ in 0..count {
@@ -2074,6 +2186,7 @@ fn read_unit_equipments_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>>
         let template = read_item(s)?.map_or(0, |i| i.template);
         slots.push((slot, template));
     }
+    s.read_u64()?; // item mask
     some(WorldEvent::UnitEquipmentsChanged { obj, slots })
 }
 
@@ -2095,23 +2208,32 @@ fn read_pvp_points(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 
 // ---- doodad readers ------------------------------------------------------------------------
 
-/// `Doodad.Write` (models/doodad.rs:247), a fixed 91-byte record.
-const DOODAD_RECORD: usize = 91;
+/// The smallest 10.x `Doodad.Write` record.
+const DOODAD_RECORD: usize = 100;
 
+/// `Doodad.Write` (10.x): bc obj, packed (template, func group = phase, goods template, 0), flags
+/// (1 loot, 2 quest glow), bc owner, bc parent, attach point, position, three `i16` angles, scale,
+/// `i64` owner id, `i64` item template, `u32` 0, time left, plant time, family, puzzle group, owner
+/// type, owner db id, data, data2, now, the goods part when there is a goods template, then two
+/// `i64`.
 fn read_doodad(s: &mut PacketStream) -> Res<DoodadInfo> {
     let obj = s.read_bc()?;
-    let template = s.read_u32()?;
+    let packed = s.read_pisc_w(4)?;
+    let (template, phase, goods) = (packed[0] as u32, packed[1] as u32, packed[2]);
+    let flags = s.read_u8()?;
     let owner_obj = s.read_bc()?;
     let parent_obj = s.read_bc()?;
     skip(s, 1)?; // attach point
     let pos = s.read_position()?;
     skip(s, 6 + 4)?; // roll, pitch, yaw, scale
-    let has_loot = s.read_bool()?;
-    let phase = s.read_u32()?;
-    let owner_id = s.read_u32()?;
-    skip(s, 8 + 4 + 4 + 4 + 8)?; // ucc id, item template, type2, time left, plant time
-    let quest_glow = s.read_u32()?;
-    skip(s, 4 + 4 + 1 + 4 + 4)?; // family, puzzle group, owner type, owner db id, data
+    let owner_id = s.read_i64()? as u32;
+    // item template, 0, time left, plant time, family, puzzle group, owner type, owner db id,
+    // data, data2, now
+    skip(s, 8 + 4 + 4 + 8 + 4 + 4 + 1 + 4 + 4 + 4 + 8)?;
+    if goods != 0 {
+        skip(s, 8 + 8 + 2)?;
+    }
+    skip(s, 8 + 8)?;
     Ok(DoodadInfo {
         obj,
         template,
@@ -2120,8 +2242,8 @@ fn read_doodad(s: &mut PacketStream) -> Res<DoodadInfo> {
         parent_obj,
         phase,
         owner_id,
-        quest_glow,
-        has_loot,
+        quest_glow: u32::from(flags & 2 != 0),
+        has_loot: flags & 1 != 0,
     })
 }
 
@@ -2144,6 +2266,7 @@ fn read_doodads_created(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 fn read_doodad_removed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let mut objs = SmallVec::new();
     objs.push(s.read_bc()?);
+    skip(s, 1)?; // keep
     some(WorldEvent::DoodadsRemoved(objs))
 }
 
@@ -2162,11 +2285,15 @@ fn read_doodads_removed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 fn read_doodad_phase(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let obj = s.read_bc()?;
     let phase = s.read_u32()?;
+    skip(s, 4 + 4 + 4 + 4)?; // data, time left, puzzle group, item template
+    if s.read_bool()? {
+        skip(s, 8 + 8 + 2)?; // physical goods
+    }
     some(WorldEvent::DoodadPhase { obj, phase })
 }
 
 /// One entry of `SCResponseCommonFarmListPacket`: four `u32`, a position (9 bytes), an `i64`.
-const FARM_ENTRY: usize = 4 * 4 + 9 + 8;
+const FARM_ENTRY: usize = 4 * 4 + 11 + 8;
 
 fn read_common_farm_list(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     skip(s, 4)?; // the count is written twice
@@ -2252,40 +2379,52 @@ fn read_task_detail_gems(s: &mut PacketStream) -> Res<Option<u8>> {
     })
 }
 
+/// One task of `SCItemTaskSuccessPacket` (10.x `ItemAction` numbering): the action byte, the
+/// log-type byte every task carries, then the action's body.
 fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
     let action = s.read_u8()?;
+    skip(s, 1)?; // log type
+    let money = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
     Ok(match action {
-        1 => ItemChange::Money(s.read_i32()?),
-        2 => ItemChange::BankMoney(s.read_i32()?),
+        1 => ItemChange::Money(money(s.read_i64()?)),
+        2 => ItemChange::BankMoney(money(s.read_i64()?)),
         3 => ItemChange::GamePoint {
             kind: s.read_u8()?,
             amount: s.read_i32()?,
         },
-        16 => ItemChange::AaPoint(s.read_i32()?),
-        17 => ItemChange::BankAaPoint(s.read_i32()?),
-        18 => ItemChange::AutoUseAaPoint(s.read_u8()?),
-        5 | 6 | 15 => {
-            // slot type, slot, then `write_task_item_details` (models/item_task.rs:358)
+        17 => ItemChange::AaPoint(money(s.read_i64()?)),
+        18 => ItemChange::BankAaPoint(money(s.read_i64()?)),
+        19 => ItemChange::AutoUseAaPoint(s.read_u8()?),
+        // Take (6), Remove (7, the same body) and ChangeOwner (16): slot type, slot, Item.Write
+        6 | 7 | 16 => {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let template = s.read_u32()?;
-            let id = s.read_u64()?;
-            let grade = s.read_u8()?;
-            skip(s, 1)?; // flags
-            let count = s.read_i32()?;
-            skip_task_details(s)?;
-            skip(s, 8 + 4 + 4 + 1 + 8 + 8)?; // create time, lifespan, made unit, world, times
-            ItemChange::Added {
-                action,
-                slot_type,
-                slot,
-                template,
-                id,
-                grade,
-                count,
+            if template == 0 {
+                return invalid("item task with an empty item");
+            }
+            let item = read_item_body(s, template)?;
+            if action == 7 {
+                ItemChange::Removed {
+                    slot_type,
+                    slot,
+                    id: item.id,
+                    template,
+                }
+            } else {
+                ItemChange::Added {
+                    action,
+                    slot_type,
+                    slot,
+                    template,
+                    id: item.id,
+                    grade: item.grade,
+                    count: item.count,
+                }
             }
         }
-        4 => {
+        // Create (ItemCountUpdate): slot type, slot, id, i32 count change, template
+        5 => {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
@@ -2299,19 +2438,21 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
                 template,
             }
         }
-        7 => {
+        // Seize (ItemRemove / ItemRemoveSlot): owner type, slot type, slot, id
+        14 => {
+            skip(s, 1)?;
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
-            let template = s.read_u32()?;
             ItemChange::Removed {
                 slot_type,
                 slot,
                 id,
-                template,
+                template: 0,
             }
         }
-        8 => {
+        // SwapSlot (ItemMove)
+        9 => {
             let from_slot_type = s.read_u8()?;
             let from_slot = s.read_u8()?;
             let to_slot_type = s.read_u8()?;
@@ -2328,7 +2469,7 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
                 to_id,
             }
         }
-        14 => {
+        15 => {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
@@ -2340,7 +2481,8 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
                 grade,
             }
         }
-        9 => {
+        // UpdateDetail: slot type, slot, id, the 128-byte padded detail block
+        10 => {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
@@ -2352,7 +2494,8 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
                 gems,
             }
         }
-        10 => {
+        // SetFlagsBits: slot type, slot, id, bits, u64 0
+        11 => {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
@@ -2365,12 +2508,15 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
                 bits,
             }
         }
-        11 => {
+        // UpdateFlags (security): owner type, slot type, slot, id, bits, previous bits, three
+        // flags, unsecure and unpack times
+        12 => {
+            skip(s, 1)?;
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
             let bits = s.read_u8()?;
-            skip(s, 3 + 8 + 8)?; // three flags, unsecure and unpack time
+            skip(s, 1 + 3 + 8 + 8)?;
             ItemChange::FlagsUpdated {
                 slot_type,
                 slot,
@@ -2378,15 +2524,18 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
                 bits,
             }
         }
-        12 => ItemChange::RemovedCrafting(s.read_u64()?),
-        13 => {
+        13 => ItemChange::RemovedCrafting(s.read_u64()?),
+        // UpdateChargeUseSkillTime: slot type, slot, id, time
+        20 => {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
-            ItemChange::RemovedSlot {
+            skip(s, 8)?;
+            ItemChange::FlagsUpdated {
                 slot_type,
                 slot,
                 id,
+                bits: 0,
             }
         }
         other => return invalid(format!("unknown item task action {other}")),
@@ -2397,6 +2546,7 @@ fn read_lunagem_result(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let result = s.read_u8()?;
     let item_id = s.read_u64()?;
     let gem = s.read_u32()?;
+    s.read_u8()?; // kind
     let installed = s.read_bool()?;
     some(WorldEvent::LunagemResult {
         result,
@@ -2411,6 +2561,7 @@ fn read_grade_enchant_result(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let item = read_item(s)?;
     let before = s.read_u8()?;
     let after = s.read_u8()?;
+    skip(s, 4 + 4 + 1)?; // break reward item, count, by mail
     let (item_id, template) = item.map_or((0, 0), |i| (i.id, i.template));
     some(WorldEvent::GradeEnchantResult {
         result,
@@ -2428,6 +2579,17 @@ fn read_item_task(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 /// The item tasks of an `SCItemTaskSuccessPacket` body; `SCTradeMadePacket` starts with the same
 /// layout (its `action` byte is the task `reason`).
 pub(crate) fn read_item_task_info(s: &mut PacketStream) -> Res<ItemTaskInfo> {
+    skip(s, 1)?; // unit owner type
+    let info = read_item_task_list(s)?;
+    if s.remaining() >= 8 + 4 + 1 + 8 {
+        skip(s, 8 + 4 + 1 + 8)?; // type, lock slot key, query result, flags
+    }
+    Ok(info)
+}
+
+/// The task list shared by `SCItemTaskSuccessPacket` and `SCTradeMadePacket`: reason, tasks,
+/// forced removals.
+pub(crate) fn read_item_task_list(s: &mut PacketStream) -> Res<ItemTaskInfo> {
     let reason = s.read_u8()?;
     let count = usize::from(s.read_u8()?);
     check_count(s, count, 1, "item task")?;
@@ -2450,8 +2612,9 @@ pub(crate) fn read_item_task_info(s: &mut PacketStream) -> Res<ItemTaskInfo> {
 
 fn read_labor_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let delta = s.read_i32()?;
-    let actability = s.read_i32()?;
-    let point = s.read_i32()?;
+    skip(s, 4 + 4)?; // local amount, recharged amount
+    let packed = s.read_pisc_w(2)?;
+    let (actability, point) = (packed[0] as i32, packed[1] as i32);
     let step = s.read_u8()?;
     some(WorldEvent::LaborChanged {
         delta,
@@ -2463,7 +2626,7 @@ fn read_labor_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 
 fn read_skill_learned(s: &mut PacketStream, upgrade: bool) -> Res<Option<WorldEvent>> {
     let skill = s.read_u32()?;
-    let level = s.read_u8()?;
+    let level = if upgrade { s.read_u8()? } else { 1 };
     some(WorldEvent::SkillLearned {
         skill,
         level,
@@ -2488,6 +2651,9 @@ fn read_cooldown_list(s: &mut PacketStream) -> Res<Box<[Cooldown]>> {
 fn read_cooldowns(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let skills = read_cooldown_list(s)?;
     let tags = read_cooldown_list(s)?;
+    let charges = s.read_u32()? as usize;
+    check_count(s, charges, 12, "cooldown charge")?;
+    skip(s, charges * 12)?;
     some(WorldEvent::Cooldowns { skills, tags })
 }
 
@@ -2496,6 +2662,7 @@ fn read_cooldown_reset(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let skill = s.read_u32()?;
     let tag = s.read_u32()?;
     let gcd = s.read_bool()?;
+    skip(s, 3)?; // reset tag / toggle / toggle tag cooldowns
     some(WorldEvent::CooldownReset {
         obj,
         skill,
@@ -2511,7 +2678,7 @@ fn read_cast_target(s: &mut PacketStream) -> Res<u32> {
     Ok(match kind {
         0 | 4 => s.read_bc()?,
         1 => {
-            skip(s, 8 + 8 + 4 + 4 + 3 + 3)?;
+            skip(s, 8 + 8 + 4 + 4 + 3 + 3 + 3)?; // x, y, z, rotation, three objects
             0
         }
         2 => {
@@ -2530,18 +2697,19 @@ fn read_cast_target(s: &mut PacketStream) -> Res<u32> {
     })
 }
 
-/// `SkillObject.Write` (systems/skills/types.rs:456); an unknown flag has no body.
+/// The skill object of an SC skill packet (`WriteSkillCastExtra`): the flag byte (type in the low 6
+/// bits), then the body of the type.
 fn skip_skill_object(s: &mut PacketStream) -> Res<()> {
-    match s.read_u8()? {
-        1 => skip(s, 1 + 4 + 8 + 8 + 4),
+    match s.read_u8()? & 0x3F {
+        1 => skip(s, 1 + 4 + 8 + 8 + 4 + 4), // portal: kind, id, x, y, z, indun zone key
         2 => {
             skip(s, 4)?;
             skip_sized(s)
         }
-        3 | 6 => skip_sized(s),
+        3 => skip_sized(s),
         4 => skip(s, 8 + 8 + 4),
         5 => skip(s, 4),
-        7 => skip(s, 4 + 8 + 1),
+        6 => skip(s, 8 + 1), // regrade charm: support item, auto AA point
         _ => Ok(()),
     }
 }
@@ -2552,14 +2720,23 @@ fn read_skill_started(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let caster_obj = read_skill_caster(s)?;
     let target_obj = read_cast_target(s)?;
     skip_skill_object(s)?;
-    skip(s, 2 + 2 + 1)?; // cast times, cast synergy
+    skip(s, 2 + 2 + 2)?; // cast times, cast synergy (u16)
+                         // WriteSkillCastTail: flags, then byte (1), u16 (2), u32 (4), bool (8)
     let extra_flags = s.read_u8()?;
-    // `SetSkillResult` sets bit 1 and the byte only for a non-zero result.
     let result = if extra_flags & 1 != 0 {
         s.read_u8()?
     } else {
         0
     };
+    if extra_flags & 2 != 0 {
+        skip(s, 2)?;
+    }
+    if extra_flags & 4 != 0 {
+        skip(s, 4)?;
+    }
+    if extra_flags & 8 != 0 {
+        skip(s, 1)?;
+    }
     some(WorldEvent::SkillStarted {
         caster_obj,
         skill,
@@ -2583,14 +2760,15 @@ fn read_casting_stopped(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 
 fn read_buff_created(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let caster_obj = read_skill_caster(s)?;
-    skip(s, 4)?; // caster id
+    skip(s, 8)?; // caster id
     let obj = s.read_bc()?;
     let index = s.read_u32()?;
     let buff_id = s.read_u32()?;
     let caster_level = s.read_u8()?;
     skip(s, 2)?; // ability level
     let skill_id = s.read_u32()?;
-    // Buff.WriteData: pisc(charge, duration / 10, 0, tick / 10)
+    skip(s, 4)?; // stack
+                 // Buff.WriteData: pisc(charge, duration / 10, 0, tick / 10)
     let data = s.read_pisc_w(4)?;
     some(WorldEvent::BuffCreated {
         obj,
@@ -2612,18 +2790,22 @@ fn read_buff_removed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 
 // ---- chat / error / loot readers -----------------------------------------------------------
 
+/// `SCChatMessagePacket` (10.x): u8 locale, u64 chat (type in the low 16 bits), bc sender, i64
+/// type, language, race, u32 faction, str name, str message, 4 link bytes, i32 ability, 3 bytes.
+/// The sender's character id is not sent (0).
 fn read_chat(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
-    let kind = s.read_i16()?;
-    skip(s, 2 + 4)?; // sub type, channel faction
+    skip(s, 1)?; // client locale
+    let kind = (s.read_u64()? & 0xFFFF) as u16 as i16;
     let sender_obj = s.read_bc()?;
-    let sender_id = s.read_u32()?;
-    skip(s, 1 + 1 + 4)?; // language, race, sender faction
-    let name = boxed(s.read_string()?);
+    skip(s, 8 + 1 + 1 + 4)?; // type, language, race, faction
+    let name = s.read_string()?;
+    let name = boxed(name.strip_prefix("GM ").map(str::to_owned).unwrap_or(name));
     let msg = boxed(s.read_string()?);
+    skip(s, 4 + 4 + 3)?; // links, ability, tail
     some(WorldEvent::Chat {
         kind,
         sender_obj,
-        sender_id,
+        sender_id: 0,
         name,
         msg,
     })
@@ -2682,34 +2864,34 @@ fn read_loot_bag(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     })
 }
 
+/// `SCLootItemTookPacket` (10.x): u64 template, u64 (owner obj << 32 | owner type << 16 | index),
+/// u32 count.
 fn read_loot_took(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
-    let template = s.read_u32()?;
-    let index = s.read_u16()?;
-    let owner_type = s.read_u16()?;
-    let owner_obj = s.read_bc()?;
-    skip(s, 1)?;
-    let count = s.read_i32()?;
+    let template = s.read_u64()? as u32;
+    let iid = s.read_u64()?;
+    let count = s.read_u32()? as i32;
     some(WorldEvent::LootTook {
         template,
-        index,
+        index: (iid & 0xFFFF) as u16,
         count,
-        owner_type,
-        owner_obj,
+        owner_type: ((iid >> 16) & 0xFFFF) as u16,
+        owner_obj: (iid >> 32) as u32,
     })
 }
 
+/// 10.x: u16 0, u16 error, i64 item id (owner << 32 | type << 16 | index), i32 owner type, bc
+/// owner.
 fn read_loot_failed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
-    let err = s.read_i16()?;
-    let index = s.read_u16()?;
-    let owner_type = s.read_u16()?;
+    s.read_u16()?;
+    let err = s.read_u16()? as i16;
+    let item_id = s.read_i64()? as u64;
+    let owner_type = s.read_i32()? as u16;
     let owner_obj = s.read_bc()?;
-    skip(s, 1)?;
-    let template = s.read_u32()?;
     some(WorldEvent::LootFailed {
         err,
-        index,
+        index: item_id as u16,
         owner_type,
         owner_obj,
-        template,
+        template: 0,
     })
 }

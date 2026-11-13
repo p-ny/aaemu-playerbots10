@@ -11,8 +11,9 @@
 use std::time::Duration;
 
 use aa_proto::cs::{self, Out};
-use aa_proto::game::{GameConn, GameError, Packet};
+use aa_proto::game::{GameConn, GameError, Packet, LEVEL_PROXY};
 use aa_proto::login::{LoginClient, LoginError, WorldCookie};
+use aa_proto::opcodes::pp;
 use aa_proto::sc::{self, ServerEvent};
 use aa_proto::sc_world::{CharSummary, WorldEvent};
 use smallvec::SmallVec;
@@ -38,8 +39,6 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PING_EVERY: Duration = Duration::from_secs(3);
 /// How long the login server exchange may take in total.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(45);
-/// Quiet time after the character data before the bot spawns (the inventory burst has ended).
-const SETTLE: Duration = Duration::from_millis(300);
 /// The last `ChangeState` the lobby answers with `FinishState`.
 const LAST_STATE: i32 = 7;
 
@@ -69,6 +68,9 @@ pub enum SessionError {
     /// a race the server does not offer): another name would not help.
     #[error("the server could not create the character (reason {0})")]
     CreateFailed(u8),
+    /// The key exchange of `X2EnterWorldResponsePacket` failed (a bad server key).
+    #[error("key exchange failed: {0}")]
+    KeyExchange(String),
     /// `SCKicked`.
     #[error("kicked by the server (reason {reason}): {msg}")]
     Kicked {
@@ -102,6 +104,7 @@ impl SessionError {
             SessionError::NameRejected(_) => return None,
             SessionError::CreateFailed(r) => Cause::CreateFailed(*r),
             SessionError::Kicked { reason, .. } => Cause::Kicked(*reason),
+            SessionError::KeyExchange(_) => Cause::Protocol,
         };
         Some(Fault { phase, cause })
     }
@@ -366,7 +369,14 @@ async fn login_exchange(
         .find(|w| w.active && (world_id == 0 || w.id == world_id))
         .ok_or(SessionError::NoWorld)?;
     let (gs_id, world_name) = (world.id, world.name.clone());
-    let cookie = login.enter_world(gs_id).await?;
+    let mut cookie = login.enter_world(gs_id).await?;
+    // A game server registered without an address is on the login server's host.
+    if let Some(host) = addr
+        .rsplit_once(':')
+        .and_then(|(h, _)| h.parse::<std::net::Ipv4Addr>().ok())
+    {
+        cookie.game_addr = cookie.resolve(host);
+    }
     Ok(LoginTicket {
         login,
         account_id,
@@ -407,7 +417,6 @@ enum Step {
     List,
     Create,
     Select,
-    Settle,
     Spawn,
 }
 
@@ -417,16 +426,18 @@ impl Step {
             Step::Enter => "the enter-world answer",
             Step::List => "the character list",
             Step::Create => "the character creation",
-            Step::Select => "the character data",
-            Step::Settle => "the character data",
+            Step::Select => "the world loading states",
             Step::Spawn => "the own unit state",
         }
     }
 }
 
-/// Runs the lobby on an open game connection: presents the cookie, answers the connection state
-/// machine, lists the account's characters, creates or selects one and spawns it. `st` receives
-/// every event on the way; `start` is the bot clock's origin.
+/// Runs the lobby on an open game connection (10.x flow): presents the cookie, exchanges the
+/// session keys (`X2EnterWorldResponse` -> `CSAesXorKey`, encryption on), answers the connection
+/// state machine, waits for the character list and state 2 (character select), creates or
+/// selects a character, finishes the loading states 3..7, then `CSSpawnCharacter` and
+/// `CSNotifyInGame`; the own `SCUnitState` completes it with `CSNotifyInGameCompleted`. `st`
+/// receives every event on the way; `start` is the bot clock's origin.
 pub async fn enter_game<R, W>(
     conn: &mut GameConn<R, W>,
     st: &mut BotState,
@@ -442,16 +453,18 @@ where
     send_traced(conn, st, start, &cs::enter_world(account_id, cookie)).await?;
     let mut step = Step::Enter;
     let mut deadline = Instant::now() + STEP_TIMEOUT;
-    // Ping immediately: see PING_EVERY.
-    let mut next_ping = Instant::now();
+    // Pings start with encryption (the first right after the key exchange): see PING_EVERY.
+    let mut next_ping: Option<Instant> = None;
     let mut chars: SmallVec<[CharSummary; 4]> = SmallVec::new();
+    let mut list_done = false;
+    let mut state2 = false;
     let mut created = false;
     loop {
         let now = Instant::now();
         if now >= deadline {
             return Err(SessionError::Timeout(step.what()));
         }
-        if now >= next_ping {
+        if next_ping.is_some_and(|t| now >= t) {
             send_traced(
                 conn,
                 st,
@@ -459,30 +472,29 @@ where
                 &cs::ping(start.elapsed().as_millis() as i64),
             )
             .await?;
-            next_ping = now + PING_EVERY;
+            next_ping = Some(now + PING_EVERY);
         }
-        let mut wait = deadline.min(next_ping).saturating_duration_since(now);
-        if step == Step::Settle {
-            wait = wait.min(SETTLE);
-        }
+        let wait = next_ping
+            .map_or(deadline, |t| deadline.min(t))
+            .saturating_duration_since(now);
         let packet = match tokio::time::timeout(wait, conn.recv()).await {
             Ok(r) => r?,
-            Err(_) => {
-                if step == Step::Settle {
-                    send_traced(conn, st, start, &cs::spawn_character()).await?;
-                    step = Step::Spawn;
-                    deadline = Instant::now() + STEP_TIMEOUT;
-                }
-                continue;
-            }
+            Err(_) => continue,
         };
         st.now_ms = start.elapsed().as_millis() as u64;
         st.watch
             .packet(st.now_ms, Dir::S2C, packet.level, packet.opcode);
         st.watch.conn.on_rx(st.now_ms);
+        if packet.level == LEVEL_PROXY && packet.opcode == pp::PingPacket {
+            if let Some(pong) = cs::pong_for(&packet.body, st.now_ms as u32) {
+                send_traced(conn, st, start, &pong).await?;
+            }
+            continue;
+        }
         let Some(ev) = decode(&packet) else { continue };
         st.apply(&ev);
         let ServerEvent::World(w) = &ev else { continue };
+        let mut pick = false;
         match (step, w) {
             (_, WorldEvent::Kicked { reason, msg }) => {
                 return Err(SessionError::Kicked {
@@ -493,52 +505,43 @@ where
             (Step::Enter, WorldEvent::EnterWorldResponse { reason, .. }) if *reason != 0 => {
                 return Err(SessionError::Refused(*reason));
             }
-            (Step::Enter, WorldEvent::ChangeState(n)) => {
-                if (0..=LAST_STATE).contains(n) {
+            (Step::Enter, WorldEvent::EnterWorldResponse { pub_key, .. }) => {
+                let (keys, cipher) =
+                    cs::key_exchange(pub_key).map_err(SessionError::KeyExchange)?;
+                send_traced(conn, st, start, &keys).await?;
+                conn.enable_encryption(cipher);
+                next_ping = Some(Instant::now());
+                step = Step::List;
+                deadline = Instant::now() + STEP_TIMEOUT;
+            }
+            (_, WorldEvent::ChangeState(n)) => {
+                // State 2 (character select) is finished by selecting a character.
+                if *n == 2 {
+                    state2 = true;
+                    pick = true;
+                } else if (0..=LAST_STATE).contains(n) {
                     send_traced(conn, st, start, &cs::finish_state(*n)).await?;
                 }
-                if *n >= LAST_STATE {
-                    send_traced(conn, st, start, &cs::list_characters()).await?;
-                    step = Step::List;
-                    chars.clear();
+                if *n == LAST_STATE && step == Step::Select {
+                    send_traced(conn, st, start, &cs::spawn_character()).await?;
+                    send_traced(conn, st, start, &cs::notify_in_game()).await?;
+                    step = Step::Spawn;
                 }
                 deadline = Instant::now() + STEP_TIMEOUT;
             }
             (Step::List, WorldEvent::CharacterList { last, chars: c }) => {
                 chars.extend(c.iter().cloned());
                 if *last {
-                    let pick = wish
-                        .char_id
-                        .and_then(|id| chars.iter().find(|c| c.id == id))
-                        .or_else(|| {
-                            chars
-                                .iter()
-                                .find(|c| c.name.eq_ignore_ascii_case(wish.name))
-                        })
-                        .or_else(|| chars.first());
-                    match pick {
-                        Some(c) => {
-                            send_traced(conn, st, start, &cs::select_character(c.id)).await?;
-                            step = Step::Select;
-                        }
-                        None => {
-                            let create = cs::create_character(&cs::CreateCharacter {
-                                name: wish.name,
-                                race: wish.race,
-                                gender: wish.gender,
-                                body_items: [0; 7],
-                                ability1: wish.ability,
-                            });
-                            send_traced(conn, st, start, &create).await?;
-                            step = Step::Create;
-                        }
-                    }
-                    deadline = Instant::now() + STEP_TIMEOUT;
+                    list_done = true;
+                    pick = true;
                 }
             }
             (Step::Create, WorldEvent::CharacterCreated { id, .. }) => {
                 created = true;
                 send_traced(conn, st, start, &cs::select_character(*id)).await?;
+                if state2 {
+                    send_traced(conn, st, start, &cs::finish_state(2)).await?;
+                }
                 step = Step::Select;
                 deadline = Instant::now() + STEP_TIMEOUT;
             }
@@ -549,12 +552,7 @@ where
                     SessionError::CreateFailed(*reason)
                 });
             }
-            (Step::Select, WorldEvent::CharacterState(_)) => {
-                step = Step::Settle;
-                deadline = Instant::now() + STEP_TIMEOUT;
-            }
             (Step::Spawn, WorldEvent::UnitState(_)) if st.me.spawned && st.me.obj != 0 => {
-                send_traced(conn, st, start, &cs::notify_in_game()).await?;
                 send_traced(conn, st, start, &cs::notify_in_game_completed()).await?;
                 return Ok(Entered {
                     char_id: st.me.char_id,
@@ -563,6 +561,36 @@ where
                 });
             }
             _ => {}
+        }
+        if pick && step == Step::List && list_done && state2 {
+            let found = wish
+                .char_id
+                .and_then(|id| chars.iter().find(|c| c.id == id))
+                .or_else(|| {
+                    chars
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(wish.name))
+                })
+                .or_else(|| chars.first());
+            match found {
+                Some(c) => {
+                    send_traced(conn, st, start, &cs::select_character(c.id)).await?;
+                    send_traced(conn, st, start, &cs::finish_state(2)).await?;
+                    step = Step::Select;
+                }
+                None => {
+                    let create = cs::create_character(&cs::CreateCharacter {
+                        name: wish.name,
+                        race: wish.race,
+                        gender: wish.gender,
+                        body_items: [0; 7],
+                        ability1: wish.ability,
+                    });
+                    send_traced(conn, st, start, &create).await?;
+                    step = Step::Create;
+                }
+            }
+            deadline = Instant::now() + STEP_TIMEOUT;
         }
     }
 }
@@ -619,12 +647,31 @@ mod tests {
         }
     }
 
-    /// A server that accepts the cookie, walks the state machine, lists no characters and
-    /// refuses the creation.
+    /// The 10.x `X2EnterWorldResponsePacket` body that accepts the connection with `key`'s blob.
+    fn enter_world_response(key: &aa_proto::crypto::keys::TestServerKey) -> Vec<u8> {
+        let blob = key.blob();
+        let mut body = Vec::new();
+        body.extend(0i16.to_le_bytes()); // reason
+        body.extend(7u32.to_le_bytes()); // stream token
+        body.extend(1250u16.to_le_bytes()); // stream port
+        body.extend(0u64.to_le_bytes()); // server time
+        body.extend(0xffff_ff4cu32.to_le_bytes()); // tz
+        body.extend((blob.len() as u16).to_le_bytes());
+        body.extend((blob.len() as u16).to_le_bytes());
+        body.extend(&blob);
+        body.extend(0x0100_007fu32.to_le_bytes()); // nat address
+        body.extend(1250u16.to_le_bytes()); // nat port
+        body.extend(1u32.to_le_bytes()); // authority
+        body
+    }
+
+    /// A 10.x server that accepts the cookie, exchanges the session keys, walks the state machine
+    /// to state 2 (character select) with an empty character list and refuses the creation.
     async fn fake_server<T: AsyncRead + AsyncWrite + Unpin>(
         mut srv: GameConn<tokio::io::ReadHalf<T>, tokio::io::WriteHalf<T>>,
         reject_with: u8,
     ) -> (Vec<u16>, String) {
+        let key = aa_proto::crypto::keys::TestServerKey::generate();
         let mut seen = Vec::new();
         let mut created_name = String::new();
         loop {
@@ -635,25 +682,27 @@ mod tests {
             seen.push(p.opcode);
             match (p.level, p.opcode) {
                 (LEVEL_GAME, cso::X2EnterWorldPacket) => {
-                    // reason 0, gm false, token 7, stream port 1250
-                    let mut body = vec![0, 0, 0];
-                    body.extend(7u32.to_le_bytes());
-                    body.extend(1250u16.to_le_bytes());
-                    srv.send(&sc_out(sco::X2EnterWorldResponsePacket, body))
-                        .await
-                        .unwrap();
+                    srv.send(&sc_out(
+                        sco::X2EnterWorldResponsePacket,
+                        enter_world_response(&key),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                (LEVEL_GAME, cso::CSAesXorKeyPacket) => {
+                    srv.accept_client_cipher(key.unwrap(&p.body).expect("session keys"));
                     srv.send(&change_state(0)).await.unwrap();
                 }
                 (LEVEL_PROXY, pp::FinishStatePacket) => {
                     let n = i32::from_le_bytes(p.body[..4].try_into().unwrap());
-                    if n < LAST_STATE {
+                    if n < 1 {
                         srv.send(&change_state(n + 1)).await.unwrap();
+                    } else if n == 1 {
+                        srv.send(&sc_out(sco::SCCharacterListPacket, vec![1, 0]))
+                            .await
+                            .unwrap();
+                        srv.send(&change_state(2)).await.unwrap();
                     }
-                }
-                (LEVEL_GAME, cso::CSListCharacterPacket) => {
-                    srv.send(&sc_out(sco::SCCharacterListPacket, vec![1, 0]))
-                        .await
-                        .unwrap();
                 }
                 (LEVEL_GAME, cso::CSCreateCharacterPacket) => {
                     let len = u16::from_le_bytes([p.body[0], p.body[1]]) as usize;
@@ -691,11 +740,12 @@ mod tests {
         drop(client);
         let (seen, name) = server.await.unwrap();
         assert_eq!(name, "Tester");
-        // enter, ten state answers in order (0..=7), the list request, the creation
+        // enter, the key exchange, state answers 0 and 1 (state 2 is finished by a choice), the
+        // creation
         assert_eq!(seen[0], cso::X2EnterWorldPacket);
+        assert_eq!(seen[1], cso::CSAesXorKeyPacket);
         let finishes = seen.iter().filter(|o| **o == pp::FinishStatePacket).count();
-        assert_eq!(finishes, 8, "FinishState 0..=7: {seen:?}");
-        assert!(seen.contains(&cso::CSListCharacterPacket));
+        assert_eq!(finishes, 2, "FinishState 0 and 1: {seen:?}");
         assert_eq!(*seen.last().unwrap(), cso::CSCreateCharacterPacket);
     }
 
@@ -1030,10 +1080,10 @@ mod tests {
     #[test]
     fn a_malformed_packet_is_told_from_one_the_bots_do_not_need() {
         use aa_proto::game::LEVEL_GAME;
-        // a packet nobody here parses
+        // a packet nobody here parses (0xfff marks the 1.2 packets 10.x does not have)
         let ignored = Packet {
             level: LEVEL_GAME,
-            opcode: 0xfff,
+            opcode: 0xffe,
             body: bytes::Bytes::new(),
         };
         assert!(matches!(decode_checked(&ignored), Decoded::Ignored));

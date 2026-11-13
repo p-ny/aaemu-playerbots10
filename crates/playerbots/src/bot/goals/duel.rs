@@ -28,7 +28,7 @@ use std::fmt::Write;
 
 use aa_proto::cs;
 use aa_proto::sc::ServerEvent;
-use aa_proto::sc_activity::{duel_det, ActivityEvent};
+use aa_proto::sc_activity::{duel_det, ActivityEvent, SELF_OBJ};
 use aa_proto::sc_world::WorldEvent;
 use pb_web::Activity;
 
@@ -208,8 +208,12 @@ impl DuelWatch {
             ActivityEvent::DuelStarted {
                 challenger_obj,
                 challenged_obj,
-            } if me_obj != 0 && (*challenger_obj == me_obj || *challenged_obj == me_obj) => {
-                let opponent = if *challenger_obj == me_obj {
+            } if me_obj != 0
+                && (*challenger_obj == me_obj
+                    || *challenged_obj == me_obj
+                    || *challenger_obj == SELF_OBJ) =>
+            {
+                let opponent = if *challenger_obj == me_obj || *challenger_obj == SELF_OBJ {
                     *challenged_obj
                 } else {
                     *challenger_obj
@@ -228,13 +232,14 @@ impl DuelWatch {
                 det,
                 ..
             } if me_obj != 0 => {
-                let mine = *winner_obj == me_obj || *loser_obj == me_obj;
+                let is_me = |o: u32| o == me_obj || o == SELF_OBJ;
+                let mine = is_me(*winner_obj) || is_me(*loser_obj);
                 if !mine && *det != duel_det::DRAW {
                     return;
                 }
                 let outcome = if *det == duel_det::DRAW {
                     Outcome::Draw
-                } else if *winner_obj == me_obj {
+                } else if is_me(*winner_obj) {
                     Outcome::Won
                 } else {
                     Outcome::Lost

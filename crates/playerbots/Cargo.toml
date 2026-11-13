@@ -1,6 +1,6 @@
 [package]
 name = "playerbots"
-description = "Headless ArcheAge 1.2 player bots for the AAEmu Rust server"
+description = "Headless ArcheAge 10.0.2.13 player bots for the AAEmu 10.x server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

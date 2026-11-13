@@ -120,6 +120,18 @@ pub fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     .with_context(|| format!("look for table `{name}`"))
 }
 
+/// Whether `table` has a column `column` (false when the table is missing). The loaders use it to
+/// read both the 1.2 and the 10.x `compact.sqlite3`, whose schemas differ in a few tables.
+pub fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    // (not a probing SELECT: SQLite reads an unknown double-quoted name as a string literal)
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2 COLLATE NOCASE",
+        [table, column],
+        |r| r.get::<_, i64>(0),
+    )
+    .is_ok_and(|n| n > 0)
+}
+
 /// Runs `sql` and calls `f` for every row.
 pub fn each_row(conn: &Connection, sql: &str, mut f: impl FnMut(&Row<'_>)) -> Result<()> {
     let mut stmt = conn

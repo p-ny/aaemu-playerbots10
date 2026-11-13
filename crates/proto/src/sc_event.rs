@@ -91,6 +91,8 @@ pub(crate) fn read_list(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 pub(crate) fn read_start(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let id = read_key(s)?;
     let zone_key = s.read_u32()?;
+    s.read_bool()?; // start seamless world
+    s.read_bool()?; // broadcast seamless
     some(WorldEvent::TowerDefStart { id, zone_key })
 }
 
@@ -98,6 +100,8 @@ pub(crate) fn read_start(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 pub(crate) fn read_end(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let id = read_key(s)?;
     let zone_key = s.read_u32()?;
+    s.read_bool()?;
+    s.read_bool()?;
     some(WorldEvent::TowerDefEnd { id, zone_key })
 }
 
@@ -107,5 +111,6 @@ pub(crate) fn read_wave(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let id = read_key(s)?;
     let zone_key = s.read_u32()?;
     let step = s.read_u32()?;
+    s.read_bool()?; // sync step
     some(WorldEvent::TowerDefWave { id, zone_key, step })
 }

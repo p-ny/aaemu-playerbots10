@@ -56,15 +56,15 @@ fn fx64(v: f32) -> i64 {
 
 // ---- session --------------------------------------------------------------------------------
 
-/// `X2EnterWorldPacket` (level 1): presents the login server's world cookie.
-/// Server read: `packets/c2g.rs:30`.
+/// `X2EnterWorldPacket` (level 1, sent before the key exchange): presents the login server's
+/// world cookie. Server read: `C2G/X2EnterWorldPacket.cs`.
 ///
-/// Body: `u32 0, u32 0, u32 account_id, u32 cookie, i32 0 zone, u8 0 tb, u64 0 revision`.
+/// Body: `u32 0, u32 0, u64 account_id, u32 cookie, i32 0 zone, u8 0 tb, u64 0 revision`.
 pub fn enter_world(account_id: u32, cookie: u32) -> Out {
     game(cs::X2EnterWorldPacket, |s| {
         s.write_u32(0)
             .write_u32(0)
-            .write_u32(account_id)
+            .write_u64(u64::from(account_id))
             .write_u32(cookie)
             .write_i32(0)
             .write_u8(0)
@@ -93,12 +93,61 @@ pub fn ping(ms: i64) -> Out {
     })
 }
 
-/// `CSListCharacterPacket`. Server read: `packets/c2g.rs:174`.
+/// `CSAesXorKeyPacket` (level 1, plaintext): the session keys, each RSA-wrapped with the key of
+/// `X2EnterWorldResponsePacket`. Server read: `C2G/CSAesXorKeyPacket.cs`.
 ///
-/// Body: `i32 0, u16 0` (a size and an empty sized byte array).
+/// Body: `i32 128, i16 128, 128 bytes rsa(aes key), 128 bytes rsa(xor key)`.
+pub fn aes_xor_key(enc_aes: &[u8; 128], enc_xor: &[u8; 128]) -> Out {
+    game(cs::CSAesXorKeyPacket, |s| {
+        s.write_i32(128)
+            .write_i16(128)
+            .write_raw(enc_aes)
+            .write_raw(enc_xor);
+    })
+}
+
+/// The answer to a server `PingPacket` (proxy): a [`pong`] echoing its fields; `None` for a body
+/// that is not a ping (`i64 tm, i64 when, u32 local`).
+pub fn pong_for(ping_body: &[u8], world_ms: u32) -> Option<Out> {
+    let mut s = PacketStream::from_bytes(ping_body.to_vec());
+    let tm = s.read_i64().ok()?;
+    let when = s.read_i64().ok()?;
+    let local = s.read_u32().ok()?;
+    Some(pong(tm, when, local, world_ms))
+}
+
+/// The session keys for the C→S cipher, wrapped with the server's key from
+/// `X2EnterWorldResponsePacket`: the `CSAesXorKeyPacket` to send (plain) and the cipher to enable
+/// right after it ([`crate::game::GameConn::enable_encryption`]).
+pub fn key_exchange(pub_key: &[u8]) -> Result<(Out, crate::crypto::ctos::CsCipher), String> {
+    use crate::crypto::keys;
+    let server_key = keys::parse_public_key(pub_key).map_err(|e| e.to_string())?;
+    let mut rng = rand::thread_rng();
+    let session = keys::SessionKeys::generate(&mut rng);
+    let (enc_aes, enc_xor) = session
+        .wrap(&mut rng, &server_key)
+        .map_err(|e| e.to_string())?;
+    Ok((aes_xor_key(&enc_aes, &enc_xor), session.cipher()))
+}
+
+/// `CSRefreshInCharacterListPacket` (empty): the character-select poll. The 10.x server sends the
+/// character list on its own after the key exchange; this asks again.
 pub fn list_characters() -> Out {
-    game(cs::CSListCharacterPacket, |s| {
-        s.write_i32(0).write_bytes_sized(&[]);
+    game(cs::CSRefreshInCharacterListPacket, |_| {})
+}
+
+/// `PongPacket` (proxy): the answer to the server's `PingPacket`, echoing its `tm`, `when` and
+/// `local`. Server read: `Proxy/PongPacket.cs`.
+///
+/// Body: `i64 tm, i64 when, i64 0 elapsed, i64 0 remote, u32 local, u32 world`.
+pub fn pong(tm: i64, when: i64, local: u32, world_ms: u32) -> Out {
+    proxy(pp::PongPacket, |s| {
+        s.write_i64(tm)
+            .write_i64(when)
+            .write_i64(0)
+            .write_i64(0)
+            .write_u32(local)
+            .write_u32(world_ms);
     })
 }
 
@@ -117,59 +166,34 @@ pub struct CreateCharacter<'a> {
     pub ability1: u8,
 }
 
-/// `CSCreateCharacterPacket`. Server read: `packets/c2g_world.rs:22`.
+/// `CSCreateCharacterPacket`. Server read: `C2G/CSCreateCharacterPacket.cs`.
 ///
 /// Body: `str name, u8 race, u8 gender, 7 x u32 body items, UnitCustomModelParams, u8 ability1,
-/// u8 11 ability2 (none), u8 11 ability3 (none), u8 1 level`.
+/// u8 0 ability2, u8 0 ability3, u8 1 level, u32 0 intro zone`.
 ///
-/// The appearance is a type-3 (`Face`) `UnitCustomModelParams` with every field zero and a
-/// 128-byte zero modifier, 231 bytes: the form the real client sends and the one proven against
-/// the server (`models/unit_model.rs:106` for `FaceModel`, `:161` for the type gating). The
-/// server also accepts the 1-byte type-0 form; it is not used so a bot never gets a model
-/// without a face.
+/// The appearance is the 1-byte type-0 `UnitCustomModelParams` (`ext = 0`): the race template's
+/// default look, which the 10.x server accepts.
 pub fn create_character(c: &CreateCharacter<'_>) -> Out {
     game(cs::CSCreateCharacterPacket, |s| {
         s.write_str(c.name).write_u8(c.race).write_u8(c.gender);
         for item in c.body_items {
             s.write_u32(item);
         }
-        write_default_face(s);
-        s.write_u8(c.ability1).write_u8(11).write_u8(11).write_u8(1);
+        s.write_u8(0) // UnitCustomModelParams ext 0
+            .write_u8(c.ability1)
+            .write_u8(0)
+            .write_u8(0)
+            .write_u8(1)
+            .write_u32(0);
     })
 }
 
-/// A zero `UnitCustomModelParams` of type 3 (231 bytes).
-fn write_default_face(s: &mut PacketStream) {
-    s.write_u8(3) // UnitCustomModelType.Face
-        .write_u32(0) // hair color
-        .write_u32(0) // skin color
-        .write_u32(0); // model id
-                       // FaceModel
-    s.write_u32(0) // movable decal asset
-        .write_f32(0.0) // weight
-        .write_f32(0.0) // scale
-        .write_f32(0.0) // rotate
-        .write_i16(0) // move x
-        .write_i16(0); // move y
-    for _ in 0..4 {
-        s.write_u32(0).write_f32(0.0); // fixed decal assets
-    }
-    for _ in 0..3 {
-        s.write_u32(0); // diffuse, normal, eyelash maps
-    }
-    s.write_f32(0.0); // normal map weight
-    for _ in 0..5 {
-        s.write_u32(0); // lip, pupils, eyebrow, deco colors
-    }
-    s.write_bytes_sized(&[0u8; 128]); // modifier
-}
-
-/// `CSSelectCharacterPacket`. Server read: `packets/c2g_world.rs:124`.
+/// `CSSelectCharacterPacket`. Server read: `C2G/CSSelectCharacterPacket.cs`.
 ///
-/// Body: `u32 character_id, bool false gm, u8 0`.
+/// Body: `u64 character_id, bool false exit`.
 pub fn select_character(character_id: u32) -> Out {
     game(cs::CSSelectCharacterPacket, |s| {
-        s.write_u32(character_id).write_bool(false).write_u8(0);
+        s.write_u64(u64::from(character_id)).write_bool(false);
     })
 }
 
@@ -410,7 +434,8 @@ pub fn move_unit(m: &MoveUnit) -> Out {
             .write_i8(0)
             .write_u8(m.stance)
             .write_u8(m.alertness)
-            .write_u8(actor);
+            .write_u16(u16::from(actor))
+            .write_u8(0); // trailing byte the 10.x client always sends
     })
 }
 
@@ -540,10 +565,8 @@ pub enum SkillObject {
     },
     /// Flag 5 `SkillObjectUnk5`: `i32` (the server calls it `step`).
     Unk5(i32),
-    /// Flag 6 `SkillObjectUnk6`: `str`.
-    Unk6(String),
-    /// Flag 7 `SkillObjectItemGradeEnchantingSupport`: `u32 id, u64 support item id,
-    /// bool auto use AA point`.
+    /// Flag 6 `SkillObjectItemGradeEnchantingSupport` (10.x): `u64 support item id, bool auto use
+    /// AA point`; `id` is not sent.
     ItemGradeEnchantingSupport {
         /// Enchanting support id.
         id: u32,
@@ -564,8 +587,7 @@ impl SkillObject {
             SkillObject::Text(_) => 3,
             SkillObject::Position { .. } => 4,
             SkillObject::Unk5(_) => 5,
-            SkillObject::Unk6(_) => 6,
-            SkillObject::ItemGradeEnchantingSupport { .. } => 7,
+            SkillObject::ItemGradeEnchantingSupport { .. } => 6,
         }
     }
 
@@ -584,7 +606,7 @@ impl SkillObject {
             SkillObject::SavePortalInfo { id, name } => {
                 s.write_i32(*id).write_str(name);
             }
-            SkillObject::Text(t) | SkillObject::Unk6(t) => {
+            SkillObject::Text(t) => {
                 s.write_str(t);
             }
             SkillObject::Position { x, y, z } => {
@@ -594,13 +616,11 @@ impl SkillObject {
                 s.write_i32(*step);
             }
             SkillObject::ItemGradeEnchantingSupport {
-                id,
                 support_item_id,
                 auto_use_aa_point,
+                ..
             } => {
-                s.write_u32(*id)
-                    .write_u64(*support_item_id)
-                    .write_bool(*auto_use_aa_point);
+                s.write_u64(*support_item_id).write_bool(*auto_use_aa_point);
             }
         }
     }
@@ -618,6 +638,7 @@ fn start_skill(
         caster(s);
         target(s);
         object.write(s);
+        s.write_u8(0); // input direction
     })
 }
 
@@ -628,7 +649,8 @@ fn unit_caster(caster: u32) -> impl FnOnce(&mut PacketStream) {
     }
 }
 
-/// Caster block of an inventory item: `u8 2, bc obj, u64 item id, u32 template, u8 0, u32 0`.
+/// Caster block of an inventory item: `u8 2, bc obj, u64 item id, u32 template, u8 0, u64 0`
+/// (`SkillItem.Read`, as the 10.x client sends it).
 fn item_caster(caster: u32, item_id: u64, item_template: u32) -> impl FnOnce(&mut PacketStream) {
     move |s| {
         s.write_u8(2)
@@ -636,7 +658,7 @@ fn item_caster(caster: u32, item_id: u64, item_template: u32) -> impl FnOnce(&mu
             .write_u64(item_id)
             .write_u32(item_template)
             .write_u8(0)
-            .write_u32(0);
+            .write_u64(0);
     }
 }
 
@@ -644,7 +666,8 @@ fn item_caster(caster: u32, item_id: u64, item_template: u32) -> impl FnOnce(&mu
 /// Server read: `systems/skills/handlers.rs:33`, `SkillCaster::read` `systems/skills/types.rs:66`,
 /// `SkillCastTarget::read` `:236`.
 ///
-/// Body: `u32 skill, u8 0 caster type, bc caster, u8 0 target type, bc target, u8 0 flag`.
+/// Body: `u32 skill, u8 0 caster type, bc caster, u8 0 target type, bc target, u8 0 flag, u8 0
+/// input direction` (14 bytes, as the 10.x client sends it).
 pub fn start_skill_unit(skill_id: u32, caster: u32, target: u32) -> Out {
     start_skill_unit_with(skill_id, caster, target, &SkillObject::None)
 }
@@ -692,7 +715,7 @@ pub fn start_skill_doodad_with(
 /// Server read as [`start_skill_unit`] (`SkillCastTarget::read` position variant).
 ///
 /// Body: `u32 skill, u8 0, bc caster, u8 1 target type, fx64 x, fx64 y, f32 z, f32 rot, bc 0,
-/// bc 0, u8 0`.
+/// bc 0, bc 0, u8 0 flag, u8 0 input direction`.
 pub fn start_skill_position(
     skill_id: u32,
     caster: u32,
@@ -719,6 +742,7 @@ pub fn start_skill_position_with(
                 .write_i64(fx64(pos.1))
                 .write_f32(pos.2)
                 .write_f32(rotation)
+                .write_bc(0)
                 .write_bc(0)
                 .write_bc(0);
         },
@@ -985,14 +1009,19 @@ fn neutralize(text: &str) -> String {
 }
 
 fn chat_packet(chat_type: i16, target: &str, message: &str) -> Out {
+    // 10.x (`CSSendChatMessagePacket.Read`, field order of the client's serializer): i8 client
+    // locale, u64 chat (type in the low 16 bits), str target, i8 target world (-1), str message,
+    // i8 language, u32 ability, then the chat-link block (an empty one: u32 0), as the 10.x client
+    // sends it.
     game(cs::CSSendChatMessagePacket, |s| {
-        s.write_i16(chat_type)
-            .write_i16(0)
-            .write_i32(0)
+        s.write_u8(2)
+            .write_u64(u64::from(chat_type as u16))
             .write_str(target)
+            .write_u8(0xFF)
             .write_str(message)
-            .write_u8(0)
-            .write_i32(0);
+            .write_u8(9)
+            .write_i32(0)
+            .write_u32(0);
     })
 }
 
@@ -1089,8 +1118,9 @@ pub const DUEL_DECLINE: i16 = 507;
 ///
 /// Body: `u32 challenged_character_id`.
 pub fn challenge_duel(challenged_character_id: u32) -> Out {
+    // 10.x: u8 duel type (0), u64 challenged character
     game(cs::CSChallengeDuelPacket, |s| {
-        s.write_u32(challenged_character_id);
+        s.write_u8(0).write_u64(u64::from(challenged_character_id));
     })
 }
 
@@ -1099,8 +1129,11 @@ pub fn challenge_duel(challenged_character_id: u32) -> Out {
 ///
 /// Body: `u32 challenger_character_id, i16 error` ([`DUEL_ACCEPT`] or [`DUEL_DECLINE`]).
 pub fn start_duel(challenger_character_id: u32, error: i16) -> Out {
+    // 10.x: u64 challenger, i16 error (0 accept, 507 refuse), u8 duel type
     game(cs::CSStartDuelPacket, |s| {
-        s.write_u32(challenger_character_id).write_i16(error);
+        s.write_u64(u64::from(challenger_character_id))
+            .write_i16(error)
+            .write_u8(0);
     })
 }
 
@@ -1160,7 +1193,7 @@ pub fn takedown_trade_item(slot_type: u8, slot: u8) -> Out {
 /// Body: `i32 amount`.
 pub fn putup_trade_money(amount: i32) -> Out {
     game(cs::CSPutupTradeMoneyPacket, |s| {
-        s.write_i32(amount);
+        s.write_i64(i64::from(amount));
     })
 }
 
@@ -1202,8 +1235,12 @@ pub const RISKY_DISMISS: u8 = 2;
 ///
 /// Body: `u32 team_id, bool is_party, str name`.
 pub fn invite_to_team(team_id: u32, is_party: bool, name: &str) -> Out {
+    // 10.x: i32 team, i8 team role (1 party, 2 raid), str name, i8 world (-1 = this one)
     game(cs::CSInviteToTeamPacket, |s| {
-        s.write_u32(team_id).write_bool(is_party).write_str(name);
+        s.write_u32(team_id)
+            .write_u8(if is_party { 1 } else { 2 })
+            .write_str(name)
+            .write_u8(0xFF);
     })
 }
 
@@ -1220,13 +1257,17 @@ pub fn reply_to_join_team(
     char_name: &str,
     is_area: bool,
 ) -> Out {
+    // 10.x: i32 team, bool party, u64 owner, bool reject, str name, bool area, i8 team role,
+    // i64 log event
     game(cs::CSReplyToJoinTeamPacket, |s| {
         s.write_u32(team_id)
             .write_bool(is_party)
-            .write_u32(owner_character_id)
+            .write_u64(u64::from(owner_character_id))
             .write_bool(reject)
             .write_str(char_name)
-            .write_bool(is_area);
+            .write_bool(is_area)
+            .write_u8(if is_party { 1 } else { 2 })
+            .write_i64(0);
     })
 }
 
@@ -1237,7 +1278,7 @@ pub fn reply_to_join_team(
 pub fn ask_risky_team_action(team_id: u32, target_character_id: u32, action: u8) -> Out {
     game(cs::CSAskRiskyTeamActionPacket, |s| {
         s.write_u32(team_id)
-            .write_u32(target_character_id)
+            .write_u64(u64::from(target_character_id))
             .write_u8(action);
     })
 }
@@ -1262,7 +1303,8 @@ pub mod team_role {
 /// Body: `u32 team_id, u32 member_character_id`.
 pub fn make_team_owner(team_id: u32, member_character_id: u32) -> Out {
     game(cs::CSMakeTeamOwnerPacket, |s| {
-        s.write_u32(team_id).write_u32(member_character_id);
+        s.write_u32(team_id)
+            .write_u64(u64::from(member_character_id));
     })
 }
 
@@ -1360,7 +1402,7 @@ pub fn execute_craft(craft_id: u32, bench_obj: u32, count: i32) -> Out {
 /// Body: `bc npc`.
 pub fn sell_backpack_goods(npc_obj: u32) -> Out {
     game(cs::CSSellBackpackGoodsPacket, |s| {
-        s.write_bc(npc_obj);
+        s.write_bc(npc_obj).write_bc(0);
     })
 }
 
@@ -1400,7 +1442,7 @@ pub fn buy_items(npc_obj: u32, goods: &[BuyItem]) -> Out {
                 .write_i32(g.count)
                 .write_u8(g.currency);
         }
-        s.write_bool(false);
+        s.write_bool(false).write_u8(0); // use AA point, open type
     })
 }
 
@@ -1437,7 +1479,15 @@ pub fn request_common_farm_list() -> Out {
 
 /// `CSListMailPacket` (empty): opens the mailbox. Server read: `systems/economy/mail_packets.rs:470`.
 pub fn list_mail() -> Out {
-    game(cs::CSListMailPacket, |_| {})
+    // 10.x, as the client sends it: u8 kind 1, u32 start 1, u32 sent count 1, bool recover,
+    // bool test
+    game(cs::CSListMailPacket, |s| {
+        s.write_u8(1)
+            .write_u32(1)
+            .write_u32(1)
+            .write_bool(false)
+            .write_bool(false);
+    })
 }
 
 /// `CSReadMailPacket`. Server read: `systems/economy/mail_packets.rs:505`.
@@ -1742,7 +1792,7 @@ pub fn remove_mate(tl: u16) -> Out {
 /// Body: `u16 tl`.
 pub fn bind_slave(tl: u16) -> Out {
     game(cs::CSBindSlavePacket, |s| {
-        s.write_u16(tl);
+        s.write_u16(tl).write_i32(0); // skill type
     })
 }
 

@@ -102,7 +102,11 @@ impl Housing {
         let mut designs = Vec::new();
         each_row(
             conn,
-            "SELECT h.id, h.name, h.category_id, COALESCE(t.tax, 0), COALESCE(t.\"SHOW\", 'f'), h.garden_radius \n             FROM housings h LEFT JOIN taxations t ON t.id = h.taxation_id",
+            if crate::sql::has_column(conn, "housings", "garden_radius") {
+                "SELECT h.id, h.name, h.category_id, COALESCE(t.tax, 0), COALESCE(t.\"SHOW\", 'f'), h.garden_radius \n             FROM housings h LEFT JOIN taxations t ON t.id = h.taxation_id"
+            } else {
+                "SELECT h.id, h.name, h.category_id, COALESCE(t.tax, 0), COALESCE(t.\"SHOW\", 'f'), COALESCE(z.garden_radius, 0) \n             FROM housings h LEFT JOIN taxations t ON t.id = h.taxation_id \n             LEFT JOIN housing_sizes z ON z.id = h.housing_size_id"
+            },
             |r| {
                 let id = r.u32(0);
                 if !placeable.contains(&r.u32(2)) {

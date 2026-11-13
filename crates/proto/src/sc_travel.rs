@@ -241,20 +241,27 @@ impl ShipMotion {
 
 /// `PortalWire.write` (G/packets/world.rs:216-236): `u32 id, str name, u32 zone, f32 x, f32 y, f32 z,
 /// f32 z rot`.
+/// 10.x `Portal.Write`: `u32 id, str name, u32 type, u32 zone, f32 x, f32 y (from the zone
+/// origin), f32 z, f32 z rot, bool favorite, bool disabled, u8 faction permission`.
 fn read_portal_entry(s: &mut PacketStream) -> Res<PortalEntry> {
-    Ok(PortalEntry {
-        id: s.read_u32()?,
-        name: boxed(s.read_string()?),
+    let id = s.read_u32()?;
+    let name = boxed(s.read_string()?);
+    s.read_u32()?; // type
+    let e = PortalEntry {
+        id,
+        name,
         zone_id: s.read_u32()?,
         off_x: s.read_f32()?,
         off_y: s.read_f32()?,
         z: s.read_f32()?,
         z_rot: s.read_f32()?,
-    })
+    };
+    skip(s, 1 + 1 + 1)?; // favorite, disabled, faction permission
+    Ok(e)
 }
 
-/// Smallest `PortalWire` on the wire: id, empty name (length prefix), zone, four floats.
-const PORTAL_ENTRY_MIN: usize = 4 + 2 + 4 + 16;
+/// Smallest `Portal.Write` on the wire.
+const PORTAL_ENTRY_MIN: usize = 4 + 2 + 4 + 4 + 16 + 3;
 
 /// `i32 count` + that many entries (G/packets/world.rs:248 and :268).
 fn read_portal_list(s: &mut PacketStream) -> Res<Box<[PortalEntry]>> {
@@ -289,6 +296,7 @@ pub(crate) fn read_portal_saved(s: &mut PacketStream) -> Res<Option<WorldEvent>>
 
 /// `SCPortalDeletedPacket` (G/systems/npcs/portal/packets.rs:270, writer :281).
 pub(crate) fn read_portal_deleted(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    s.read_u8()?; // 10.x leading byte
     let kind = s.read_u8()?;
     let id = s.read_i32()?;
     some(WorldEvent::PortalDeleted { kind, id })
@@ -303,9 +311,9 @@ pub(crate) fn read_portal_used(s: &mut PacketStream) -> Res<Option<WorldEvent>> 
 
 /// `SCProcessingInstancePacket` (G/systems/instances/packets.rs:387, writer :397).
 pub(crate) fn read_processing_instance(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
-    some(WorldEvent::ProcessingInstance {
-        zone_id: s.read_i32()?,
-    })
+    let zone_id = s.read_i32()?;
+    s.read_u32()?; // state
+    some(WorldEvent::ProcessingInstance { zone_id })
 }
 
 // ---- readers: boats ------------------------------------------------------------------------
@@ -314,12 +322,15 @@ pub(crate) fn read_processing_instance(s: &mut PacketStream) -> Res<Option<World
 /// u64 item id, u8 user state, i32 experience, i32 mileage, u32 spawn delay`, then ten `u32`
 /// skill slots (the writer pads `10 - skills` zeros, G/systems/vehicles/packets.rs:90-92).
 pub(crate) fn read_mate_spawned(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    // 10.x: u16 tl, u8 mate type, u32 id, u64 item id, u8 user state, u32 experience, u32 spawn
+    // delay, ten u32 skill slots (no mileage)
     let tl = s.read_u16()?;
+    s.read_u8()?; // mate type
     let id = s.read_u32()?;
     let item_id = s.read_u64()?;
     let user_state = s.read_u8()?;
-    let experience = s.read_i32()?;
-    let mileage = s.read_i32()?;
+    let experience = s.read_u32()? as i32;
+    let mileage = 0;
     let spawn_delay_ms = s.read_u32()?;
     let mut skills = Vec::with_capacity(MATE_SKILL_SLOTS);
     for _ in 0..MATE_SKILL_SLOTS {
@@ -345,7 +356,7 @@ pub(crate) fn read_slave_created(s: &mut PacketStream) -> Res<Option<WorldEvent>
     let owner_obj = s.read_bc()?;
     let tl = s.read_u16()?;
     let slave_obj = s.read_bc()?;
-    let hide_effect = s.read_bool()?;
+    let hide_effect = false; // not sent in 10.x
     skip(s, 8)?; // unk id
     let creator = boxed(s.read_string()?);
     some(WorldEvent::SlaveCreated {
@@ -363,8 +374,8 @@ pub(crate) fn read_my_slave(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let tl = s.read_u16()?;
     let name = boxed(s.read_string()?);
     let template = s.read_u32()?;
-    let hp = s.read_i32()?;
-    let max_hp = s.read_i32()?;
+    let hp = s.read_u64()?.min(i32::MAX as u64) as i32;
+    let max_hp = s.read_u64()?.min(i32::MAX as u64) as i32;
     let x = convert_long_to_coord(s.read_i64()?);
     let y = convert_long_to_coord(s.read_i64()?);
     let z = s.read_f32()?;
@@ -381,7 +392,8 @@ pub(crate) fn read_my_slave(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 
 /// `SCSlaveBoundPacket` (G/systems/vehicles/packets.rs:140): a character took the driver's seat.
 pub(crate) fn read_slave_bound(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
-    let master_id = s.read_u32()?;
+    let master_id = s.read_u64()? as u32;
+    s.read_u8()?; // master world
     let slave_obj = s.read_bc()?;
     some(WorldEvent::SlaveBound {
         master_id,
@@ -413,7 +425,9 @@ pub(crate) fn read_unit_detached(s: &mut PacketStream) -> Res<Option<WorldEvent>
 
 /// `SCSlaveDespawnPacket` (G/systems/vehicles/packets.rs:133).
 pub(crate) fn read_slave_despawned(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
-    some(WorldEvent::SlaveDespawned { obj: s.read_bc()? })
+    let obj = s.read_bc()?;
+    s.read_bool()?; // success
+    some(WorldEvent::SlaveDespawned { obj })
 }
 
 /// `SCSlaveRemovedPacket` (G/systems/vehicles/packets.rs:126). The id is the owner's object id
