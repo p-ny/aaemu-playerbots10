@@ -552,6 +552,9 @@ fn offer(ctx: &Ctx<'_>, ask: bool) -> Option<Offer> {
         let Some(rally) = live_rally(ctx, def, &view) else {
             continue;
         };
+        if crate::bot::war::outside_zones(ctx.world, &ctx.cfg.bots.zones, rally[0], rally[1]) {
+            continue;
+        }
         let dist_m = dist2d(me.pos, rally);
         let who = Who {
             level: me.level,

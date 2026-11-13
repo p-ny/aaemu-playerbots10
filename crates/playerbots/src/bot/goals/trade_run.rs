@@ -275,6 +275,7 @@ impl Env for Live<'_, '_> {
         let st = &*ctx.state;
         let (level, faction) = (st.me.level, st.me.faction);
         let world = ctx.world;
+        let zones = &ctx.cfg.bots.zones;
         let craft_ok = |c: &Craft| {
             if st.econ.skipped(SkipKind::Craft, c.id, now) {
                 return false;
@@ -316,6 +317,8 @@ impl Env for Live<'_, '_> {
                     // the bot will have for the run, not at its current one
                     let run_level = level.max(world.craft(p.craft).map_or(0, |c| c.req_level));
                     !route_risky(world, faction, run_level, [me[0], me[1]], p)
+                        && !crate::bot::war::outside_zones(world, zones, p.bench[0], p.bench[1])
+                        && !crate::bot::war::outside_zones(world, zones, p.buyer[0], p.buyer[1])
                 })
                 .collect();
             if let Some(p) = plan::pick(&cands, ctx.rng) {

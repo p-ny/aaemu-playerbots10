@@ -403,9 +403,22 @@ impl Housing {
         } else {
             MAX_WALK_M
         };
+        let zones = &ctx.cfg.bots.zones;
+        let in_zones: Vec<u32> = ctx
+            .world
+            .baked()
+            .housing_areas
+            .iter()
+            .filter(|p| {
+                p.points.first().is_some_and(|q| {
+                    !crate::bot::war::outside_zones(ctx.world, zones, q[0], q[1])
+                })
+            })
+            .map(|p| p.id)
+            .collect();
         let areas = rank_areas(
             &ctx.world.baked().housing_areas,
-            |id| ctx.world.housing_area_allows(id, d.category),
+            |id| ctx.world.housing_area_allows(id, d.category) && in_zones.contains(&id),
             [me[0], me[1]],
             max_dist,
             side(cells) * 2.0,
