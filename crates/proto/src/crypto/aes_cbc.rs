@@ -6,20 +6,20 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 fn cbc_encrypt<C: BlockEncrypt>(c: &C, iv: [u8; 16], data: &mut [u8]) {
     assert_eq!(data.len() % 16, 0, "CBC input must be whole blocks");
     let mut prev = iv;
-    for block in data.chunks_exact_mut(16) {
+    for block in data.as_chunks_mut::<16>().0 {
         for (b, p) in block.iter_mut().zip(prev) {
             *b ^= p;
         }
         c.encrypt_block(GenericArray::from_mut_slice(block));
-        prev.copy_from_slice(block);
+        prev = *block;
     }
 }
 
 fn cbc_decrypt<C: BlockDecrypt>(c: &C, iv: [u8; 16], data: &mut [u8]) {
     assert_eq!(data.len() % 16, 0, "CBC input must be whole blocks");
     let mut prev = iv;
-    for block in data.chunks_exact_mut(16) {
-        let cipher: [u8; 16] = block.try_into().unwrap();
+    for block in data.as_chunks_mut::<16>().0 {
+        let cipher = *block;
         c.decrypt_block(GenericArray::from_mut_slice(block));
         for (b, p) in block.iter_mut().zip(prev) {
             *b ^= p;

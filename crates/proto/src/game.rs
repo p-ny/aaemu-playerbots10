@@ -378,7 +378,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> GameConn<R, W> {
                 });
             }
             LEVEL_ENCRYPTED => {
-                let mut data = match &mut self.server_decipher {
+                let data = match &mut self.server_decipher {
                     Some(d) => d.decrypt(&frame),
                     None => {
                         let mut data = frame[2..].to_vec();

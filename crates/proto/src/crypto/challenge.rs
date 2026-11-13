@@ -13,13 +13,12 @@ use super::{aes_cbc, sha256crypt};
 pub fn response_v2(password: &str, salt: &str, rounds: u32, hc: &[u32; 8]) -> [u32; 8] {
     let key = sha256crypt::compute_raw(password, salt, rounds);
     let mut t = [0u8; 32];
-    for (chunk, v) in t.chunks_exact_mut(4).zip(hc) {
-        chunk.copy_from_slice(&v.to_le_bytes());
+    for (chunk, v) in t.as_chunks_mut::<4>().0.iter_mut().zip(hc) {
+        *chunk = v.to_le_bytes();
     }
     aes_cbc::decrypt256(&key, [0; 16], &mut t);
-    for chunk in t.chunks_exact_mut(4) {
-        let v = u32::from_le_bytes(chunk.try_into().unwrap()).wrapping_add(1);
-        chunk.copy_from_slice(&v.to_le_bytes());
+    for chunk in t.as_chunks_mut::<4>().0 {
+        *chunk = u32::from_le_bytes(*chunk).wrapping_add(1).to_le_bytes();
     }
     aes_cbc::encrypt256(&key, [0; 16], &mut t);
     std::array::from_fn(|i| u32::from_le_bytes(t[i * 4..i * 4 + 4].try_into().unwrap()))
@@ -39,9 +38,8 @@ mod tests {
         let key = sha256crypt::compute_raw("secret", "abcdefgh12345678", 1000);
         let mut t: Vec<u8> = hc.iter().flat_map(|v| v.to_le_bytes()).collect();
         aes_cbc::decrypt256(&key, [0; 16], &mut t);
-        for c in t.chunks_exact_mut(4) {
-            let v = u32::from_le_bytes(c.try_into().unwrap()).wrapping_add(1);
-            c.copy_from_slice(&v.to_le_bytes());
+        for c in t.as_chunks_mut::<4>().0 {
+            *c = u32::from_le_bytes(*c).wrapping_add(1).to_le_bytes();
         }
         aes_cbc::encrypt256(&key, [0; 16], &mut t);
         let expected: Vec<u8> = ours.iter().flat_map(|v| v.to_le_bytes()).collect();

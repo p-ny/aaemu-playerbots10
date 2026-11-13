@@ -1085,8 +1085,8 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             let tasks = s.read_u8()?;
             s.set_pos(start);
             let items = crate::sc_world::read_item_task_list(s).unwrap_or_default();
-            if s.remaining() >= 8 + 4 + 1 {
-                skip(s, 8 + 4 + 1)?; // type, lock slot key, query result
+            if s.remaining() >= TRADE_MADE_TAIL {
+                skip(s, TRADE_MADE_TAIL)?;
             }
             Ok(E::TradeMade {
                 action,
@@ -1181,14 +1181,12 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             })
         },
         // housing
-        sc::SCMyHousePacket => |s| Ok(E::MyHouse(Box::new(HouseInfo::read(s)?))),
         sc::SCLoginCharInfoHousePacket => |s| {
             Ok(E::LoginCharInfoHouse {
                 owner_id: s.read_u32()?,
                 house: Box::new(HouseInfo::read(s)?),
             })
         },
-        sc::SCMyHouseRemovedPacket => |s| Ok(E::MyHouseRemoved { tl: s.read_u16()? }),
         sc::SCHouseDemolishedPacket => |s| Ok(E::HouseDemolished { tl: s.read_u16()? }),
         sc::SCConstructHouseTaxPacket => |s| {
             // 10.x: amounts are u64, then the weekly amount (u64) and the hostile tax rate (u32)
@@ -1245,11 +1243,6 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             })
         },
         // mail
-        sc::SCCountUnreadMailPacket => |s| {
-            Ok(E::CountUnreadMail {
-                unread: read_unread(s)?,
-            })
-        },
         sc::SCGotMailPacket => mail_received,
         sc::SCMailListPacket => mail_list,
         // 10.x: u8 list kind, unread counts
@@ -1628,8 +1621,9 @@ impl HouseInfo {
 
 // ---- mail -----------------------------------------------------------------------------------
 
-/// Smallest `MailHeader.Write` (empty strings): 8+1+1+2+2+1+2+8+1+8.
-const MAIL_HEADER_MIN_LEN: usize = 34;
+/// The tail of `SCTradeMadePacket` after the task list: type (i64), lock slot key (i32), query
+/// result (bool).
+const TRADE_MADE_TAIL: usize = 8 + 4 + 1;
 
 /// Attachment slots of a mail body (G/systems/economy/mail.rs:146).
 const MAX_MAIL_ATTACHMENTS: usize = 10;
@@ -1728,11 +1722,12 @@ fn attachment_taken(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError>
         ids.push(s.read_u64()?);
     }
     let mut items = Vec::with_capacity(n);
-    for i in 0..MAX_MAIL_ATTACHMENTS {
+    let mut ids = ids.into_iter();
+    for _ in 0..MAX_MAIL_ATTACHMENTS {
         let (slot_type, slot) = (s.read_u8()?, s.read_u8()?);
-        if i < n {
+        if let Some(id) = ids.next() {
             items.push(TakenItem {
-                id: ids[i],
+                id,
                 slot_type,
                 slot,
             });

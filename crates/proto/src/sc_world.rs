@@ -1693,19 +1693,6 @@ fn read_kicked(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 
 // ---- unit readers --------------------------------------------------------------------------
 
-/// How `Inventory_Equip` (world/unit_state.rs:330) lays out the 28 equipment slots.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EquipLayout {
-    /// Characters, houses, mates: a full item or `0`, appearance parts as template only.
-    Full,
-    /// Slaves: a full item or `0` in every slot, including the appearance range.
-    Slave,
-    /// NPCs: `template, id, grade` or `0`; appearance parts template only; cosplay (27) a full item.
-    Npc,
-    /// Transfers and shipyards: only the seven appearance templates.
-    BodyOnly,
-}
-
 /// `EquipmentSerializer.Write` of a unit (10.x): a `u64` mask of the occupied slots (34), then the
 /// occupied slots: appearance parts 19..=25 as a template id (all units but slaves); for NPCs the
 /// cosplay slot 27 and 31..=33 as `Item.Write` and every other slot compact (`u32 template, u64
@@ -2358,12 +2345,6 @@ fn read_inventory(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         chunk,
         items: items.into_boxed_slice(),
     })
-}
-
-/// Reads the `(short)128`-prefixed detail block of an item task and skips it.
-fn skip_task_details(s: &mut PacketStream) -> Res<()> {
-    let len = usize::try_from(s.read_i16()?).unwrap_or(0);
-    skip(s, len)
 }
 
 /// Reads the `(short)128`-prefixed detail block of an item task (`write_padded_details`,
