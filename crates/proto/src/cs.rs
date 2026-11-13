@@ -166,10 +166,14 @@ pub struct CreateCharacter<'a> {
     pub ability1: u8,
 }
 
+/// 10.x `AbilityType.None`: the empty second and third class slot of a new character (0 is
+/// `General`).
+pub const ABILITY_NONE: u8 = 30;
+
 /// `CSCreateCharacterPacket`. Server read: `C2G/CSCreateCharacterPacket.cs`.
 ///
 /// Body: `str name, u8 race, u8 gender, 7 x u32 body items, UnitCustomModelParams, u8 ability1,
-/// u8 0 ability2, u8 0 ability3, u8 1 level, u32 0 intro zone`.
+/// u8 30 ability2 (none), u8 30 ability3 (none), u8 1 level, u32 0 intro zone`.
 ///
 /// The appearance is the 1-byte type-0 `UnitCustomModelParams` (`ext = 0`): the race template's
 /// default look, which the 10.x server accepts.
@@ -181,8 +185,8 @@ pub fn create_character(c: &CreateCharacter<'_>) -> Out {
         }
         s.write_u8(0) // UnitCustomModelParams ext 0
             .write_u8(c.ability1)
-            .write_u8(0)
-            .write_u8(0)
+            .write_u8(ABILITY_NONE)
+            .write_u8(ABILITY_NONE)
             .write_u8(1)
             .write_u32(0);
     })
