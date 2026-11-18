@@ -718,18 +718,28 @@ pub fn refused_since(errors: &[(u64, StateError)], since_ms: u64) -> bool {
         .any(|(at, e)| *at >= since_ms && matches!(e, StateError::Msg(_)))
 }
 
-/// Follows the equip the duty sent.
-fn verify(ctx: &mut Ctx<'_>, p: PendingEquip) {
-    let now = ctx.now_ms;
-    let st = &mut *ctx.state;
+/// Resolves a pending swap from equipment state and its bounded acknowledgement window.
+/// None means it is still in flight; Some(false) means it timed out.
+fn equip_result(st: &BotState, p: PendingEquip, now_ms: u64) -> Option<bool> {
     let arrived = st
         .equipment
         .iter()
         .any(|e| e.id == p.id && e.slot == p.slot);
-    let refused = !arrived && refused_since(&st.errors, p.sent_ms);
-    if !arrived && !refused && now < p.sent_ms + EQUIP_WAIT_MS {
-        return;
+    // SCErrorMsg has no swap identity and may belong to a concurrent portal or quest.
+    if !arrived && now_ms < p.sent_ms + EQUIP_WAIT_MS {
+        None
+    } else {
+        Some(arrived)
     }
+}
+
+/// Follows the equip the duty sent.
+fn verify(ctx: &mut Ctx<'_>, p: PendingEquip) {
+    let now = ctx.now_ms;
+    let st = &mut *ctx.state;
+    let Some(arrived) = equip_result(st, p, now) else {
+        return;
+    };
     let Some(mem) = st.gear.as_deref_mut() else {
         return;
     };

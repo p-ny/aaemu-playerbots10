@@ -1296,3 +1296,92 @@ fn the_gm_lines_of_a_mint_are_allowed() {
         assert_eq!(wire.line, line, "an /item line names `self`");
     }
 }
+
+fn pending_equip_fixture() -> PendingEquip {
+    PendingEquip {
+        id: 123,
+        template: 456,
+        slot: 0,
+        sent_ms: 1_000,
+    }
+}
+
+#[test]
+fn pending_equip_ignores_an_uncorrelated_server_error() {
+    let mut state = BotState::new();
+    let pending = pending_equip_fixture();
+    state.errors.push((1_100, StateError::Msg(610)));
+    assert_eq!(equip_result(&state, pending, 1_200), None);
+}
+
+#[test]
+fn pending_equip_accepts_a_later_ack_after_an_unrelated_error() {
+    let mut state = BotState::new();
+    let pending = pending_equip_fixture();
+    state.errors.push((1_100, StateError::Msg(610)));
+    assert_eq!(equip_result(&state, pending, 1_200), None);
+    state.equipment.push(EquipSlot {
+        id: pending.id,
+        template: pending.template,
+        slot: pending.slot,
+        grade: 4,
+    });
+    assert_eq!(equip_result(&state, pending, 1_300), Some(true));
+}
+
+#[test]
+fn pending_equip_times_out_only_at_the_ack_deadline() {
+    let state = BotState::new();
+    let pending = pending_equip_fixture();
+    assert_eq!(
+        equip_result(&state, pending, pending.sent_ms + EQUIP_WAIT_MS - 1),
+        None
+    );
+    assert_eq!(
+        equip_result(&state, pending, pending.sent_ms + EQUIP_WAIT_MS),
+        Some(false)
+    );
+}
+
+#[test]
+fn pending_equip_requires_the_expected_item_in_the_expected_slot() {
+    let mut state = BotState::new();
+    let pending = pending_equip_fixture();
+    state.equipment.push(EquipSlot {
+        id: pending.id + 1,
+        template: pending.template,
+        slot: pending.slot,
+        grade: 4,
+    });
+    assert_eq!(equip_result(&state, pending, 1_300), None);
+    state.equipment[0].id = pending.id;
+    state.equipment[0].slot = pending.slot + 1;
+    assert_eq!(equip_result(&state, pending, 1_300), None);
+}
+
+#[test]
+fn pending_equip_confirmed_equipment_wins_over_errors_and_timeout() {
+    let mut state = BotState::new();
+    let pending = pending_equip_fixture();
+    state.errors.push((1_100, StateError::Msg(610)));
+    state.equipment.push(EquipSlot {
+        id: pending.id,
+        template: pending.template,
+        slot: pending.slot,
+        grade: 4,
+    });
+    assert_eq!(
+        equip_result(&state, pending, pending.sent_ms + EQUIP_WAIT_MS),
+        Some(true)
+    );
+}
+
+#[test]
+fn pending_equip_old_errors_do_not_change_the_wait() {
+    let mut state = BotState::new();
+    let pending = pending_equip_fixture();
+    state
+        .errors
+        .push((pending.sent_ms - 1, StateError::Msg(610)));
+    assert_eq!(equip_result(&state, pending, 1_200), None);
+}
